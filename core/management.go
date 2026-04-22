@@ -46,6 +46,7 @@ type ManagementServer struct {
 	setupFeishuSave      func(req FeishuSetupSaveRequest) error
 	setupWeixinSave      func(req WeixinSetupSaveRequest) error
 	addPlatformToProject func(projectName, platType string, opts map[string]any, workDir, agentType string) error
+	createProject        func(projectName, workDir, agentType string) error
 	removeProject        func(projectName string) error
 	saveProjectSettings  func(projectName string, update ProjectSettingsUpdate) error
 	getProjectConfig     func(projectName string) map[string]any
@@ -91,6 +92,10 @@ func (m *ManagementServer) SetSetupWeixinSave(fn func(WeixinSetupSaveRequest) er
 
 func (m *ManagementServer) SetAddPlatformToProject(fn func(string, string, map[string]any, string, string) error) {
 	m.addPlatformToProject = fn
+}
+
+func (m *ManagementServer) SetCreateProject(fn func(string, string, string) error) {
+	m.createProject = fn
 }
 
 func (m *ManagementServer) SetRemoveProject(fn func(string) error) {
@@ -481,41 +486,68 @@ func (m *ManagementServer) handleGlobalSettings(w http.ResponseWriter, r *http.R
 // ── Project endpoints ─────────────────────────────────────────
 
 func (m *ManagementServer) handleProjects(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		mgmtError(w, http.StatusMethodNotAllowed, "GET only")
-		return
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	switch r.Method {
+	case http.MethodGet:
+		m.mu.RLock()
+		defer m.mu.RUnlock()
 
-	projects := make([]map[string]any, 0, len(m.engines))
-	for name, e := range m.engines {
-		platNames := make([]string, len(e.platforms))
-		for i, p := range e.platforms {
-			platNames[i] = p.Name()
-		}
-
-		sessCount := 0
-		e.interactiveMu.Lock()
-		sessCount = len(e.interactiveStates)
-		e.interactiveMu.Unlock()
-
-		hbEnabled := false
-		if m.heartbeatScheduler != nil {
-			if st := m.heartbeatScheduler.Status(name); st != nil {
-				hbEnabled = st.Enabled
+		projects := make([]map[string]any, 0, len(m.engines))
+		for name, e := range m.engines {
+			platNames := make([]string, len(e.platforms))
+			for i, p := range e.platforms {
+				platNames[i] = p.Name()
 			}
-		}
 
-		projects = append(projects, map[string]any{
-			"name":              name,
-			"agent_type":        e.agent.Name(),
-			"platforms":         platNames,
-			"sessions_count":    sessCount,
-			"heartbeat_enabled": hbEnabled,
+			sessCount := 0
+			e.interactiveMu.Lock()
+			sessCount = len(e.interactiveStates)
+			e.interactiveMu.Unlock()
+
+			hbEnabled := false
+			if m.heartbeatScheduler != nil {
+				if st := m.heartbeatScheduler.Status(name); st != nil {
+					hbEnabled = st.Enabled
+				}
+			}
+
+			projects = append(projects, map[string]any{
+				"name":              name,
+				"agent_type":        e.agent.Name(),
+				"platforms":         platNames,
+				"sessions_count":    sessCount,
+				"heartbeat_enabled": hbEnabled,
+			})
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"projects": projects})
+	case http.MethodPost:
+		if m.createProject == nil {
+			mgmtError(w, http.StatusServiceUnavailable, "project creation not available")
+			return
+		}
+		var body struct {
+			Name      string `json:"name"`
+			WorkDir   string `json:"work_dir"`
+			AgentType string `json:"agent_type"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		if strings.TrimSpace(body.Name) == "" {
+			mgmtError(w, http.StatusBadRequest, "name is required")
+			return
+		}
+		if err := m.createProject(body.Name, body.WorkDir, body.AgentType); err != nil {
+			mgmtError(w, http.StatusInternalServerError, "save config: "+err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusCreated, map[string]any{
+			"message":          fmt.Sprintf("project %q created", body.Name),
+			"restart_required": true,
 		})
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
 	}
-	mgmtJSON(w, http.StatusOK, map[string]any{"projects": projects})
 }
 
 // handleProjectRoutes dispatches /api/v1/projects/{name}/...

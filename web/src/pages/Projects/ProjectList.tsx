@@ -1,12 +1,14 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useNavigate } from 'react-router-dom';
-import { Server, Heart, ArrowRight, FolderKanban, Plus, Smartphone, Settings2 } from 'lucide-react';
+import { Server, Heart, ArrowRight, FolderKanban, Plus, Smartphone, Settings2, Globe } from 'lucide-react';
 import { Card, Badge, Button, Input, Modal, EmptyState } from '@/components/ui';
-import { listProjects, type ProjectSummary } from '@/api/projects';
+import { createProject, listProjects, type ProjectSummary } from '@/api/projects';
+import { restartSystem } from '@/api/status';
 import PlatformSetupQR from './PlatformSetupQR';
 import PlatformManualForm from './PlatformManualForm';
 import { platformMeta } from '@/lib/platformMeta';
+import { getAgentLabel } from '@/lib/providers';
 
 const AGENT_OPTIONS = [
   { key: 'claudecode', label: 'Claude Code' },
@@ -20,6 +22,7 @@ const AGENT_OPTIONS = [
 ];
 
 const PLATFORM_OPTIONS: { key: string; label: string; color: string; qr?: boolean }[] = [
+  { key: 'web', label: 'Web Only', color: 'bg-slate-50 dark:bg-slate-900/30 text-slate-600 dark:text-slate-300' },
   { key: 'feishu', label: 'Feishu / Lark', color: 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400', qr: true },
   { key: 'weixin', label: 'WeChat', color: 'bg-green-50 dark:bg-green-900/30 text-green-600 dark:text-green-400', qr: true },
   { key: 'telegram', label: 'Telegram', color: 'bg-sky-50 dark:bg-sky-900/30 text-sky-600 dark:text-sky-400' },
@@ -43,8 +46,10 @@ export default function ProjectList() {
   const [wizStep, setWizStep] = useState<'name' | 'platform' | 'qr' | 'form' | 'done'>('name');
   const [newProjName, setNewProjName] = useState('');
   const [newWorkDir, setNewWorkDir] = useState('');
-  const [newAgentType, setNewAgentType] = useState('claudecode');
+  const [newAgentType, setNewAgentType] = useState('codex');
   const [selectedPlat, setSelectedPlat] = useState('');
+  const [showRestartModal, setShowRestartModal] = useState(false);
+  const [creatingWebOnly, setCreatingWebOnly] = useState(false);
 
   const fetch = useCallback(async () => {
     try {
@@ -68,7 +73,7 @@ export default function ProjectList() {
     setWizStep('name');
     setNewProjName('');
     setNewWorkDir('');
-    setNewAgentType('claudecode');
+    setNewAgentType('codex');
     setSelectedPlat('');
   };
 
@@ -76,7 +81,18 @@ export default function ProjectList() {
 
   const handlePlatformSelect = (key: string) => {
     setSelectedPlat(key);
-    if (isQRPlatform(key)) {
+    if (key === 'web') {
+      setCreatingWebOnly(true);
+      createProject({ name: newProjName, work_dir: newWorkDir, agent_type: newAgentType })
+        .then(() => {
+          setShowWizard(false);
+          setShowRestartModal(true);
+        })
+        .catch((e: any) => {
+          window.alert(e?.message || String(e));
+        })
+        .finally(() => setCreatingWebOnly(false));
+    } else if (isQRPlatform(key)) {
       setWizStep('qr');
     } else if (platformMeta[key]) {
       setWizStep('form');
@@ -129,7 +145,7 @@ export default function ProjectList() {
                   <ArrowRight size={16} className="text-gray-300 dark:text-gray-600" />
                 </div>
                 <div className="flex flex-wrap gap-1.5 mb-3">
-                  <Badge variant="info">{p.agent_type}</Badge>
+                  <Badge variant="info">{getAgentLabel(p.agent_type)}</Badge>
                   {p.platforms?.map((pl) => <Badge key={pl}>{pl}</Badge>)}
                 </div>
                 <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mt-auto pt-3 border-t border-gray-100 dark:border-gray-800">
@@ -198,15 +214,16 @@ export default function ProjectList() {
                 <button
                   key={key}
                   onClick={() => handlePlatformSelect(key)}
+                  disabled={creatingWebOnly}
                   className="flex items-center gap-2.5 p-3 rounded-xl border border-gray-200 dark:border-gray-700 hover:border-accent/50 hover:bg-accent/5 transition-all text-left"
                 >
                   <div className={`w-9 h-9 rounded-lg ${color} flex items-center justify-center shrink-0`}>
-                    {qr ? <Smartphone size={16} /> : <Settings2 size={16} />}
+                    {key === 'web' ? <Globe size={16} /> : qr ? <Smartphone size={16} /> : <Settings2 size={16} />}
                   </div>
                   <div className="min-w-0">
                     <div className="text-sm font-medium text-gray-900 dark:text-white truncate">{label}</div>
                     <div className="text-[11px] text-gray-400">
-                      {qr ? t('setup.scanToConnect', 'Scan QR code') : t('setup.manualSetup', 'Manual setup')}
+                      {key === 'web' ? t('setup.webOnly', 'Web admin only') : qr ? t('setup.scanToConnect', 'Scan QR code') : t('setup.manualSetup', 'Manual setup')}
                     </div>
                   </div>
                 </button>
@@ -254,6 +271,22 @@ export default function ProjectList() {
             </div>
           </div>
         )}
+      </Modal>
+
+      <Modal open={showRestartModal} onClose={() => setShowRestartModal(false)} title={t('setup.restartRequired', 'Restart required')}>
+        <div className="space-y-4 py-2">
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            {t('setup.restartHint', 'Restart the service for the new platform to take effect.')}
+          </p>
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => { setShowRestartModal(false); fetch(); }}>
+              {t('setup.later', 'Later')}
+            </Button>
+            <Button onClick={async () => { await restartSystem(); setShowRestartModal(false); fetch(); }}>
+              {t('setup.restartNow', 'Restart now')}
+            </Button>
+          </div>
+        </div>
       </Modal>
     </div>
   );

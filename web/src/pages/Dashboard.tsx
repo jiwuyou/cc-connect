@@ -9,6 +9,7 @@ import { getStatus, type SystemStatus } from '@/api/status';
 import { listProjects, type ProjectSummary } from '@/api/projects';
 import { listSessions, type Session } from '@/api/sessions';
 import { formatUptime, formatTime } from '@/lib/utils';
+import { getAgentLabel } from '@/lib/providers';
 
 const MAX_ITEMS = 4;
 
@@ -103,7 +104,7 @@ export default function Dashboard() {
                   </div>
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-semibold text-gray-900 dark:text-white truncate">{p.name}</p>
-                    <p className="text-xs text-gray-400 font-mono">{p.agent_type}</p>
+                    <p className="text-xs text-gray-400">{getAgentLabel(p.agent_type)}</p>
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-1 mb-2">

@@ -816,6 +816,9 @@ func main() {
 			}
 			return config.AddPlatformToProject(projectName, config.PlatformConfig{Type: platType, Options: opts}, workDir, agentType)
 		})
+		mgmtSrv.SetCreateProject(func(projectName, workDir, agentType string) error {
+			return config.AddWebProject(projectName, workDir, agentType)
+		})
 		mgmtSrv.SetRemoveProject(config.RemoveProject)
 		mgmtSrv.SetSaveProjectSettings(func(name string, u core.ProjectSettingsUpdate) error {
 			return config.SaveProjectSettings(name, config.ProjectSettingsUpdate{

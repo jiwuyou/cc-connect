@@ -594,7 +594,8 @@ func (c *Config) validate() error {
 		if proj.Agent.Type == "" {
 			return fmt.Errorf("config: %s.agent.type is required", prefix)
 		}
-		if len(proj.Platforms) == 0 {
+		bridgeEnabled := c.Bridge.Enabled != nil && *c.Bridge.Enabled
+		if len(proj.Platforms) == 0 && !bridgeEnabled {
 			return fmt.Errorf("config: %s needs at least one [[projects.platforms]]", prefix)
 		}
 		for j, p := range proj.Platforms {
@@ -2546,6 +2547,50 @@ func AddPlatformToProject(projectName string, platform PlatformConfig, workDir, 
 		Name:      projectName,
 		Agent:     agentCfg,
 		Platforms: []PlatformConfig{platform},
+	})
+	return saveConfig(cfg)
+}
+
+// AddWebProject appends a new project that is intended to be used only through
+// the bridge/web UI. The bridge must already be enabled in config.toml.
+func AddWebProject(projectName, workDir, agentType string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name == projectName {
+			return fmt.Errorf("project %q already exists", projectName)
+		}
+	}
+	if cfg.Bridge.Enabled == nil || !*cfg.Bridge.Enabled {
+		return fmt.Errorf("bridge must be enabled for web-only projects")
+	}
+
+	agentCfg := pickAgentTemplateForNewProject(cfg, EnsureProjectWithFeishuOptions{
+		WorkDir:   workDir,
+		AgentType: agentType,
+	})
+	wd := strings.TrimSpace(workDir)
+	if wd != "" {
+		if agentCfg.Options == nil {
+			agentCfg.Options = map[string]any{}
+		}
+		agentCfg.Options["work_dir"] = wd
+	}
+
+	cfg.Projects = append(cfg.Projects, ProjectConfig{
+		Name:  projectName,
+		Agent: agentCfg,
 	})
 	return saveConfig(cfg)
 }

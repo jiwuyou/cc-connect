@@ -14,6 +14,7 @@ import { formatTime, cn } from '@/lib/utils';
 import PlatformSetupQR from './PlatformSetupQR';
 import PlatformManualForm from './PlatformManualForm';
 import { platformMeta } from '@/lib/platformMeta';
+import { getAgentLabel, isProviderCompatible } from '@/lib/providers';
 
 const PLATFORM_OPTIONS: { key: string; label: string; color: string; abbr: string; qr?: boolean }[] = [
   { key: 'feishu', label: 'Feishu / Lark', abbr: 'FS', color: 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400', qr: true },
@@ -214,7 +215,7 @@ export default function ProjectDetail() {
           <ArrowLeft size={18} className="text-gray-400" />
         </Link>
         <h2 className="text-xl font-bold text-gray-900 dark:text-white">{name}</h2>
-        {project && <Badge variant="info">{project.agent_type}</Badge>}
+        {project && <Badge variant="info">{getAgentLabel(project.agent_type)}</Badge>}
       </div>
 
       {/* Tabs */}
@@ -273,7 +274,10 @@ export default function ProjectDetail() {
       {tab === 'providers' && (() => {
         const globalNames = new Set(globalProviders.map(g => g.name));
         const isGlobal = (pName: string) => globalNames.has(pName) && providerRefs.includes(pName);
-        const unlinkedGlobals = globalProviders.filter(g => !providerRefs.includes(g.name));
+        const projectAgentType = project?.agent_type || '';
+        const unlinkedGlobals = globalProviders.filter(g =>
+          !providerRefs.includes(g.name) && isProviderCompatible(projectAgentType, g)
+        );
         return (
         <div className="space-y-4">
           {/* Header */}
@@ -419,6 +423,11 @@ export default function ProjectDetail() {
                         <div className="min-w-0">
                           <div className="text-sm font-medium text-gray-900 dark:text-white">{gp.name}</div>
                           <div className="text-xs text-gray-500 dark:text-gray-400 truncate">{gp.model}{gp.base_url ? ` · ${gp.base_url}` : ''}</div>
+                          {gp.agent_types && gp.agent_types.length > 0 && (
+                            <div className="mt-1 text-[11px] text-gray-400">
+                              {gp.agent_types.map(getAgentLabel).join(', ')}
+                            </div>
+                          )}
                         </div>
                         <Plus size={16} className="shrink-0 text-gray-400" />
                       </button>

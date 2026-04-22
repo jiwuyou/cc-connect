@@ -10,6 +10,7 @@ import {
   type GlobalProvider, type ProviderPreset,
 } from '@/api/providers';
 import { cn } from '@/lib/utils';
+import { getAgentLabel, getPresetAgentTypes, getPresetConfigForAgent, getPresetProviderName } from '@/lib/providers';
 
 type Tab = 'providers' | 'presets';
 
@@ -57,14 +58,16 @@ export default function ProviderList() {
   };
 
   const handleAddFromPreset = (preset: ProviderPreset) => {
-    const baseUrl = preset.endpoints?.['claudecode'] || preset.base_url;
+    const defaultAgentType = getPresetAgentTypes(preset)[0];
+    const { base_url, model } = getPresetConfigForAgent(preset, defaultAgentType);
     setEditProvider({
-      name: preset.name,
-      base_url: baseUrl,
-      model: preset.agent_models?.['claudecode'] || preset.models?.[0] || '',
+      name: getPresetProviderName(preset, defaultAgentType),
+      base_url,
+      model,
       thinking: preset.thinking || '',
       models: preset.models?.map(m => ({ model: m })),
-      agent_types: preset.agents || [],
+      agent_types: [defaultAgentType],
+      _preset_agent_type: defaultAgentType,
       _preset: preset,
     } as any);
     setShowAddModal(true);
@@ -208,7 +211,7 @@ function ProviderGrid({
               {p.agent_types && p.agent_types.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   {p.agent_types.map(a => (
-                    <Badge key={a} variant="info" className="text-xs">{a}</Badge>
+                    <Badge key={a} variant="info" className="text-xs">{getAgentLabel(a)}</Badge>
                   ))}
                 </div>
               )}
@@ -348,9 +351,39 @@ function ProviderFormModal({
   const [form, setForm] = useState<GlobalProvider>(provider || { name: '' });
   const [saving, setSaving] = useState(false);
   const [showKey, setShowKey] = useState(false);
+  const preset = (form as any)._preset as ProviderPreset | undefined;
+  const presetAgentTypes = preset ? getPresetAgentTypes(preset) : [];
+  const [presetAgentType, setPresetAgentType] = useState<string>((provider as any)?._preset_agent_type || presetAgentTypes[0] || '');
 
   const set = (key: keyof GlobalProvider, value: any) =>
     setForm(f => ({ ...f, [key]: value }));
+
+  useEffect(() => {
+    const nextForm = provider || { name: '' };
+    const nextPreset = (nextForm as any)._preset as ProviderPreset | undefined;
+    const nextPresetAgentType = (nextForm as any)._preset_agent_type || (nextPreset ? getPresetAgentTypes(nextPreset)[0] : '');
+    setForm(nextForm);
+    setPresetAgentType(nextPresetAgentType);
+  }, [provider]);
+
+  const applyPresetAgentType = (nextAgentType: string) => {
+    if (!preset) return;
+    const { base_url, model } = getPresetConfigForAgent(preset, nextAgentType);
+    const nextName = getPresetProviderName(preset, nextAgentType);
+    setPresetAgentType(nextAgentType);
+    setForm(current => {
+      const currentPresetName = getPresetProviderName(preset, presetAgentType || getPresetAgentTypes(preset)[0]);
+      const shouldRename = !current.name || current.name === preset.name || current.name === currentPresetName;
+      return {
+        ...current,
+        name: shouldRename ? nextName : current.name,
+        base_url,
+        model,
+        agent_types: [nextAgentType],
+        _preset_agent_type: nextAgentType,
+      } as GlobalProvider;
+    });
+  };
 
   const handleSubmit = async () => {
     if (!form.name) return;
@@ -417,9 +450,34 @@ function ProviderFormModal({
             <Input
               value={form.model || ''}
               onChange={e => set('model', e.target.value)}
-              placeholder="claude-sonnet-4-20250514"
+              placeholder="gpt-5.4 / claude-sonnet-4-20250514"
             />
           </div>
+
+          {preset && presetAgentTypes.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Preset agent
+              </label>
+              <select
+                value={presetAgentType}
+                onChange={e => applyPresetAgentType(e.target.value)}
+                className={cn(
+                  'w-full rounded-xl border px-3 py-2 text-sm outline-none transition-colors',
+                  'border-gray-200 bg-white text-gray-900',
+                  'dark:border-white/10 dark:bg-white/[0.04] dark:text-white',
+                  'focus:border-accent focus:ring-1 focus:ring-accent/30',
+                )}
+              >
+                {presetAgentTypes.map(agentType => (
+                  <option key={agentType} value={agentType}>{getAgentLabel(agentType)}</option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-gray-400">
+                Preset endpoint and default model will follow the selected agent.
+              </p>
+            </div>
+          )}
 
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
@@ -443,7 +501,7 @@ function ProviderFormModal({
                         : 'bg-transparent text-gray-400 border-gray-200 dark:border-white/10 hover:border-gray-300',
                     )}
                   >
-                    {at}
+                    {getAgentLabel(at)}
                   </button>
                 );
               })}

@@ -5,6 +5,7 @@ import { MessageSquare, Bot, User, Circle, ArrowRight } from 'lucide-react';
 import { Card, EmptyState, Badge } from '@/components/ui';
 import { listProjects, type ProjectSummary } from '@/api/projects';
 import { listSessions, type Session } from '@/api/sessions';
+import { getAgentLabel } from '@/lib/providers';
 
 interface ChatEntry {
   project: ProjectSummary;
@@ -114,7 +115,7 @@ export default function ChatList() {
 
                   <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mt-auto pt-3 border-t border-gray-100 dark:border-gray-800">
                     <div className="flex items-center gap-1.5">
-                      <Badge className="text-[9px]">{project.agent_type}</Badge>
+                      <Badge className="text-[9px]">{getAgentLabel(project.agent_type)}</Badge>
                       {project.platforms?.map((pl) => <Badge key={pl}>{pl}</Badge>)}
                     </div>
                     <div className="flex items-center gap-2">

@@ -48,6 +48,8 @@ export interface ProjectSettingsUpdate {
 }
 
 export const listProjects = () => api.get<{ projects: ProjectSummary[] }>('/projects');
+export const createProject = (body: { name: string; work_dir?: string; agent_type?: string }) =>
+  api.post<{ message: string; restart_required: boolean }>('/projects', body);
 export const getProject = (name: string) => api.get<ProjectDetail>(`/projects/${name}`);
 export const updateProject = (name: string, body: ProjectSettingsUpdate) => api.patch(`/projects/${name}`, body);
 
