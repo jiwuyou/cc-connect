@@ -10,6 +10,8 @@ export interface Session {
   id: string;
   session_key: string;
   name: string;
+  alias_mode?: string;
+  alias_suffix?: string;
   platform: string;
   agent_type: string;
   active: boolean;
@@ -33,6 +35,8 @@ export const getSession = (project: string, id: string, historyLimit?: number) =
   api.get<SessionDetail>(`/projects/${project}/sessions/${id}`, historyLimit ? { history_limit: String(historyLimit) } : undefined);
 export const createSession = (project: string, body: { session_key: string; name?: string }) =>
   api.post(`/projects/${project}/sessions`, body);
+export const updateSession = (project: string, id: string, body: { name: string }) =>
+  api.patch(`/projects/${project}/sessions/${id}`, body);
 export const deleteSession = (project: string, id: string) => api.delete(`/projects/${project}/sessions/${id}`);
 export const switchSession = (project: string, body: { session_key: string; session_id: string }) =>
   api.post(`/projects/${project}/sessions/switch`, body);

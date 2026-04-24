@@ -7,7 +7,7 @@ import {
   Slash, ChevronDown,
 } from 'lucide-react';
 import { Badge, Button } from '@/components/ui';
-import { listSessions, getSession, type Session, type SessionDetail } from '@/api/sessions';
+import { listSessions, getSession, updateSession, type Session, type SessionDetail } from '@/api/sessions';
 import {
   useBridgeSocket, fetchBridgeConfig,
   type BridgeConfig, type BridgeIncoming, type BridgeStatus,
@@ -547,6 +547,15 @@ export default function ChatView() {
     setDrawerOpen(false);
   }, [bridgeStatus, bridgeSend]);
 
+  const handleRenameSession = useCallback(async (session: Session, name: string) => {
+    if (!projectName) return;
+    await updateSession(projectName, session.id, { name });
+    setSessions(prev => prev.map((item) => (item.id === session.id ? { ...item, name } : item)));
+    if (currentSession?.id === session.id) {
+      setCurrentSession(prev => (prev ? { ...prev, name } : prev));
+    }
+  }, [projectName, currentSession?.id]);
+
   const canSend = bridgeStatus === 'connected';
 
   if (loading && !currentSession && sessions.length === 0) {
@@ -724,6 +733,7 @@ export default function ChatView() {
         sessions={sessions}
         currentSessionId={currentSession?.id || ''}
         onSelect={switchToSession}
+        onRename={handleRenameSession}
         onNewSession={handleNewSession}
       />
 

@@ -40,6 +40,12 @@ type providerWiringResult struct {
 	canStartInitialRefresh    bool
 }
 
+type projectRuntime struct {
+	project          config.ProjectConfig
+	engine           *core.Engine
+	effectiveWorkDir string
+}
+
 func main() {
 	checkUpdateAsync()
 
@@ -177,487 +183,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	engines := make([]*core.Engine, 0, len(cfg.Projects))
-	effectiveWorkDirs := make([]string, 0, len(cfg.Projects))
+	projectRuntimes := make([]*projectRuntime, 0, len(cfg.Projects))
+	registeredProjects := make(map[string]struct{}, len(cfg.Projects))
 
 	for _, proj := range cfg.Projects {
-		// Inject project-level run_as_user / run_as_env into the agent's
-		// opts map so agents that support isolation can pick them up
-		// without needing their own top-level config plumbing.
-		if proj.RunAsUser != "" {
-			if proj.Agent.Options == nil {
-				proj.Agent.Options = map[string]any{}
-			}
-			proj.Agent.Options["run_as_user"] = proj.RunAsUser
-			if len(proj.RunAsEnv) > 0 {
-				proj.Agent.Options["run_as_env"] = proj.RunAsEnv
-			}
-		}
-		agent, err := core.CreateAgent(proj.Agent.Type, buildAgentOptions(cfg.DataDir, proj))
+		runtime, err := buildProjectRuntime(cfg, proj, configPath, *observeFlag, *observeChannel)
 		if err != nil {
-			slog.Error("failed to create agent", "project", proj.Name, "error", err)
+			slog.Error("failed to build project runtime", "project", proj.Name, "error", err)
 			os.Exit(1)
 		}
-
-		providerWiring := wireAgentProviders(agent, proj.Agent)
-
-		var platforms []core.Platform
-		for _, pc := range proj.Platforms {
-			opts := make(map[string]any, len(pc.Options)+2)
-			for k, v := range pc.Options {
-				opts[k] = v
-			}
-			opts["cc_data_dir"] = cfg.DataDir
-			opts["cc_project"] = proj.Name
-			p, err := core.CreatePlatform(pc.Type, opts)
-			if err != nil {
-				slog.Error("failed to create platform", "project", proj.Name, "type", pc.Type, "error", err)
-				os.Exit(1)
-			}
-			platforms = append(platforms, p)
+		if runtime == nil {
+			continue
 		}
-
-		workDir, _ := proj.Agent.Options["work_dir"].(string)
-		projectState := core.NewProjectStateStore(projectStatePath(cfg.DataDir, proj.Name))
-		effectiveWorkDir := applyProjectStateOverride(proj.Name, agent, workDir, projectState)
-		startInitialRefreshIfReady(agent, providerWiring)
-		sessionFile := sessionStorePath(cfg.DataDir, proj.Name, effectiveWorkDir)
-
-		// Parse language setting
-		var lang core.Language
-		switch cfg.Language {
-		case "zh", "chinese":
-			lang = core.LangChinese
-		case "zh-TW", "zh_TW", "zhtw":
-			lang = core.LangTraditionalChinese
-		case "ja", "japanese":
-			lang = core.LangJapanese
-		case "es", "spanish":
-			lang = core.LangSpanish
-		case "en", "english":
-			lang = core.LangEnglish
-		default:
-			lang = core.LangAuto // auto-detect
-		}
-
-		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
-		showCtx := true
-		if proj.ShowContextIndicator != nil {
-			showCtx = *proj.ShowContextIndicator
-		}
-		engine.SetShowContextIndicator(showCtx)
-		showFooter := true
-		if proj.ReplyFooter != nil {
-			showFooter = *proj.ReplyFooter
-		}
-		engine.SetReplyFooterEnabled(showFooter)
-		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
-		engine.SetBaseWorkDir(workDir)
-		engine.SetProjectStateStore(projectState)
-
-		// Wire multi-workspace mode
-		if proj.Mode == "multi-workspace" {
-			baseDir := proj.BaseDir
-			if strings.HasPrefix(baseDir, "~/") {
-				home, _ := os.UserHomeDir()
-				baseDir = filepath.Join(home, baseDir[2:])
-			}
-			if err := os.MkdirAll(baseDir, 0o755); err != nil {
-				slog.Error("failed to create base_dir", "path", baseDir, "err", err)
-				continue
-			}
-			bindingStore := filepath.Join(cfg.DataDir, "workspace_bindings.json")
-			engine.SetMultiWorkspace(baseDir, bindingStore)
-			slog.Info("multi-workspace mode enabled", "project", proj.Name, "base_dir", baseDir)
-		}
-
-		// Wire terminal observation (--observe / [projects.observe])
-		observeEnabled := *observeFlag
-		obsChan := *observeChannel
-		if proj.Observe != nil {
-			if !observeEnabled && proj.Observe.Enabled {
-				observeEnabled = true
-			}
-			if obsChan == "" && proj.Observe.Channel != "" {
-				obsChan = proj.Observe.Channel
-			}
-		}
-		if observeEnabled {
-			if obsChan == "" {
-				slog.Error("observe: channel is required (use --observe-channel or set channel in [projects.observe])")
-				os.Exit(1)
-			}
-			hasSlack := false
-			for _, p := range platforms {
-				if p.Name() == "slack" {
-					hasSlack = true
-					break
-				}
-			}
-			if !hasSlack {
-				slog.Warn("observe requires a Slack platform; ignoring")
-			} else {
-				projectDir := resolveClaudeProjectDir(workDir)
-				if projectDir == "" {
-					slog.Warn("observe: could not find Claude Code project directory", "workDir", workDir)
-				} else {
-					sessionKey := fmt.Sprintf("slack:%s", obsChan)
-					engine.SetObserveConfig(projectDir, sessionKey)
-				}
-			}
-		}
-
-		// Wire global custom commands
-		for _, c := range cfg.Commands {
-			engine.AddCommand(c.Name, c.Description, c.Prompt, c.Exec, c.WorkDir, "config")
-		}
-
-		// Wire command persistence callbacks
-		engine.SetCommandSaveAddFunc(func(name, description, prompt, exec, workDir string) error {
-			return config.AddCommand(config.CommandConfig{Name: name, Description: description, Prompt: prompt, Exec: exec, WorkDir: workDir})
-		})
-		engine.SetCommandSaveDelFunc(func(name string) error {
-			return config.RemoveCommand(name)
-		})
-
-		// Wire global aliases
-		for _, a := range cfg.Aliases {
-			engine.AddAlias(a.Name, a.Command)
-		}
-		engine.SetAliasSaveAddFunc(func(name, command string) error {
-			return config.AddAlias(config.AliasConfig{Name: name, Command: command})
-		})
-		engine.SetAliasSaveDelFunc(func(name string) error {
-			return config.RemoveAlias(name)
-		})
-
-		// Wire banned words
-		if len(cfg.BannedWords) > 0 {
-			engine.SetBannedWords(cfg.BannedWords)
-		}
-
-		// Wire disabled commands (project-level)
-		if len(proj.DisabledCommands) > 0 {
-			engine.SetDisabledCommands(proj.DisabledCommands)
-		}
-
-		// Wire admin allowlist for privileged commands
-		engine.SetAdminFrom(proj.AdminFrom)
-
-		// Wire per-user role-based policies
-		if proj.Users != nil {
-			engine.SetUserRoles(buildUserRoleManager(proj.Users))
-		}
-
-		// Wire display truncation settings (includes legacy quiet → display mapping)
-		{
-			tm, tool, tmlen, toollen := config.EffectiveDisplay(cfg, &proj)
-			engine.SetDisplayConfig(core.DisplayCfg{
-				ThinkingMessages: tm,
-				ThinkingMaxLen:   tmlen,
-				ToolMaxLen:       toollen,
-				ToolMessages:     tool,
-			})
-		}
-
-		// Wire local reference normalization / rendering
-		engine.SetReferenceConfig(core.ReferenceRenderCfg{
-			NormalizeAgents: proj.References.NormalizeAgents,
-			RenderPlatforms: proj.References.RenderPlatforms,
-			DisplayPath:     proj.References.DisplayPath,
-			MarkerStyle:     proj.References.MarkerStyle,
-			EnclosureStyle:  proj.References.EnclosureStyle,
-		})
-
-		// Wire streaming preview
-		{
-			spcfg := core.DefaultStreamPreviewCfg()
-			if cfg.StreamPreview.Enabled != nil {
-				spcfg.Enabled = *cfg.StreamPreview.Enabled
-			}
-			if cfg.StreamPreview.IntervalMs != nil {
-				spcfg.IntervalMs = *cfg.StreamPreview.IntervalMs
-			}
-			if cfg.StreamPreview.MinDeltaChars != nil {
-				spcfg.MinDeltaChars = *cfg.StreamPreview.MinDeltaChars
-			}
-			if cfg.StreamPreview.MaxChars != nil {
-				spcfg.MaxChars = *cfg.StreamPreview.MaxChars
-			}
-			if cfg.StreamPreview.DisabledPlatforms != nil {
-				spcfg.DisabledPlatforms = cfg.StreamPreview.DisabledPlatforms
-			}
-			engine.SetStreamPreviewCfg(spcfg)
-		}
-
-		// Wire rate limiting
-		{
-			maxMsg := 20
-			windowSecs := 60
-			if cfg.RateLimit.MaxMessages != nil {
-				maxMsg = *cfg.RateLimit.MaxMessages
-			}
-			if cfg.RateLimit.WindowSecs != nil {
-				windowSecs = *cfg.RateLimit.WindowSecs
-			}
-			if maxMsg > 0 {
-				engine.SetRateLimitCfg(core.RateLimitCfg{
-					MaxMessages: maxMsg,
-					Window:      time.Duration(windowSecs) * time.Second,
-				})
-			}
-		}
-		// Wire outgoing rate limiting
-		{
-			var maxPS float64
-			if cfg.OutgoingRateLimit.MaxPerSecond != nil {
-				maxPS = *cfg.OutgoingRateLimit.MaxPerSecond
-			}
-			var burst int
-			if cfg.OutgoingRateLimit.Burst != nil {
-				burst = *cfg.OutgoingRateLimit.Burst
-			}
-			defaults := core.OutgoingRateLimitCfg{MaxPerSecond: maxPS, Burst: burst}
-			overrides := make(map[string]core.OutgoingRateLimitCfg)
-			for name, pc := range cfg.OutgoingRateLimit.Platforms {
-				var mps float64
-				if pc.MaxPerSecond != nil {
-					mps = *pc.MaxPerSecond
-				}
-				var b int
-				if pc.Burst != nil {
-					b = *pc.Burst
-				}
-				overrides[name] = core.OutgoingRateLimitCfg{MaxPerSecond: mps, Burst: b}
-			}
-			if maxPS > 0 || len(overrides) > 0 {
-				engine.SetOutgoingRateLimitCfg(defaults, overrides)
-			}
-		}
-
-		engine.SetDisplaySaveFunc(func(thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error {
-			return config.SaveDisplayConfig(thinkingMessages, thinkingMaxLen, toolMaxLen, toolMessages)
-		})
-
-		// Wire idle timeout
-		if cfg.IdleTimeoutMins != nil {
-			mins := *cfg.IdleTimeoutMins
-			if mins <= 0 {
-				engine.SetEventIdleTimeout(0)
-			} else {
-				engine.SetEventIdleTimeout(time.Duration(mins) * time.Minute)
-			}
-		}
-
-		// Wire auto-compress settings
-		if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
-			minGap := 30 * time.Minute
-			if proj.AutoCompress.MinGapMins != nil {
-				minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
-			}
-			maxTokens := derefInt(proj.AutoCompress.MaxTokens)
-			if maxTokens <= 0 {
-				maxTokens = 12000
-			}
-			engine.SetAutoCompressConfig(true, maxTokens, minGap)
-		}
-		if proj.ResetOnIdleMins != nil {
-			engine.SetResetOnIdle(time.Duration(*proj.ResetOnIdleMins) * time.Minute)
-		}
-
-		// Wire sender injection
-		if proj.InjectSender != nil {
-			engine.SetInjectSender(*proj.InjectSender)
-		}
-
-		// Wire speech-to-text if enabled
-		if cfg.Speech.Enabled {
-			speechCfg := core.SpeechCfg{
-				Enabled:  true,
-				Language: cfg.Speech.Language,
-			}
-			switch cfg.Speech.Provider {
-			case "groq":
-				apiKey := cfg.Speech.Groq.APIKey
-				model := cfg.Speech.Groq.Model
-				if model == "" {
-					model = "whisper-large-v3-turbo"
-				}
-				if apiKey != "" {
-					speechCfg.STT = core.NewOpenAIWhisper(apiKey, "https://api.groq.com/openai/v1", model)
-				} else {
-					slog.Warn("speech: groq provider enabled but api_key is empty")
-				}
-			case "qwen":
-				apiKey := cfg.Speech.Qwen.APIKey
-				baseURL := cfg.Speech.Qwen.BaseURL
-				model := cfg.Speech.Qwen.Model
-				if apiKey != "" {
-					speechCfg.STT = core.NewQwenASR(apiKey, baseURL, model)
-				} else {
-					slog.Warn("speech: qwen provider enabled but api_key is empty")
-				}
-			case "gemini":
-				apiKey := cfg.Speech.Gemini.APIKey
-				model := cfg.Speech.Gemini.Model
-				if apiKey != "" {
-					speechCfg.STT = core.NewGeminiSTT(apiKey, model)
-				} else {
-					slog.Warn("speech: gemini provider enabled but api_key is empty")
-				}
-			default: // "openai" or unspecified
-				apiKey := cfg.Speech.OpenAI.APIKey
-				baseURL := cfg.Speech.OpenAI.BaseURL
-				model := cfg.Speech.OpenAI.Model
-				if apiKey != "" {
-					speechCfg.STT = core.NewOpenAIWhisper(apiKey, baseURL, model)
-				} else {
-					slog.Warn("speech: openai provider enabled but api_key is empty")
-				}
-			}
-			if speechCfg.STT != nil {
-				engine.SetSpeechConfig(speechCfg)
-				slog.Info("speech: enabled", "provider", cfg.Speech.Provider)
-			}
-		}
-
-		// Wire text-to-speech if enabled
-		if cfg.TTS.Enabled {
-			ttsCfg := &core.TTSCfg{
-				Enabled:    true,
-				Voice:      cfg.TTS.Voice,
-				MaxTextLen: cfg.TTS.MaxTextLen,
-			}
-			initMode := cfg.TTS.TTSMode
-			switch initMode {
-			case "always", "voice_only":
-			case "":
-				initMode = "voice_only"
-			default:
-				slog.Warn("tts: invalid tts_mode in config, falling back to voice_only", "tts_mode", initMode)
-				initMode = "voice_only"
-			}
-			ttsCfg.SetTTSMode(initMode)
-			switch cfg.TTS.Provider {
-			case "qwen":
-				apiKey := cfg.TTS.Qwen.APIKey
-				baseURL := cfg.TTS.Qwen.BaseURL
-				model := cfg.TTS.Qwen.Model
-				if apiKey != "" {
-					ttsCfg.TTS = core.NewQwenTTS(apiKey, baseURL, model, nil)
-					ttsCfg.Provider = "qwen"
-				} else {
-					slog.Warn("tts: qwen provider enabled but api_key is empty")
-				}
-			case "minimax":
-				apiKey := cfg.TTS.MiniMax.APIKey
-				baseURL := cfg.TTS.MiniMax.BaseURL
-				model := cfg.TTS.MiniMax.Model
-				if apiKey != "" {
-					ttsCfg.TTS = core.NewMiniMaxTTS(apiKey, baseURL, model, nil)
-					ttsCfg.Provider = "minimax"
-				} else {
-					slog.Warn("tts: minimax provider enabled but api_key is empty")
-				}
-			case "espeak":
-				voice := cfg.TTS.Voice
-				if voice == "" {
-					voice = "zh" // default to Chinese
-				}
-				ttsCfg.TTS = core.NewEspeakTTS("", voice)
-				ttsCfg.Provider = "espeak"
-			case "pico":
-				voice := cfg.TTS.Voice
-				if voice == "" {
-					voice = "zh-CN" // default to Chinese (Simplified)
-				}
-				ttsCfg.TTS = core.NewPicoTTS("", voice)
-				ttsCfg.Provider = "pico"
-			case "edge":
-				voice := cfg.TTS.Voice
-				if voice == "" {
-					voice = "zh-CN-XiaoxiaoNeural" // default Chinese neural voice
-				}
-				ttsCfg.TTS = core.NewEdgeTTS(voice)
-				ttsCfg.Provider = "edge"
-			default: // "openai" or unspecified
-				apiKey := cfg.TTS.OpenAI.APIKey
-				baseURL := cfg.TTS.OpenAI.BaseURL
-				model := cfg.TTS.OpenAI.Model
-				if apiKey != "" {
-					ttsCfg.TTS = core.NewOpenAITTS(apiKey, baseURL, model, nil)
-					ttsCfg.Provider = "openai"
-				} else {
-					slog.Warn("tts: openai provider enabled but api_key is empty")
-				}
-			}
-			if ttsCfg.TTS != nil {
-				engine.SetTTSConfig(ttsCfg)
-				engine.SetTTSSaveFunc(func(mode string) error {
-					return config.SaveTTSMode(mode)
-				})
-				slog.Info("tts: enabled", "provider", ttsCfg.Provider, "voice", ttsCfg.Voice, "mode", initMode)
-			}
-		}
-
-		// Set up save callback for auto-detected language
-		if lang == core.LangAuto {
-			engine.SetLanguageSaveFunc(func(l core.Language) error {
-				return config.SaveLanguage(string(l))
-			})
-		}
-
-		// Set up save callbacks for provider management
-		projName := proj.Name
-		engine.SetProviderSaveFunc(func(providerName string) error {
-			return config.SaveActiveProvider(projName, providerName)
-		})
-		engine.SetProviderAddSaveFunc(func(p core.ProviderConfig) error {
-			return config.AddProviderToConfig(projName, config.ProviderConfig{
-				Name: p.Name, APIKey: p.APIKey, BaseURL: p.BaseURL,
-				Model: p.Model, Models: convertCoreModels(p.Models), Thinking: p.Thinking, Env: p.Env,
-			})
-		})
-		engine.SetProviderRemoveSaveFunc(func(name string) error {
-			return config.RemoveProviderFromConfig(projName, name)
-		})
-		engine.SetProviderModelSaveFunc(func(providerName, model string) error {
-			return config.SaveProviderModel(projName, providerName, model)
-		})
-		engine.SetModelSaveFunc(func(model string) error {
-			return config.SaveAgentModel(projName, model)
-		})
-
-		// Wire config reload
-		capturedEngine := engine
-		capturedProjName := projName
-		engine.SetConfigReloadFunc(func() (*core.ConfigReloadResult, error) {
-			return reloadConfig(configPath, capturedProjName, capturedEngine)
-		})
-
-		// Wire /web command callbacks
-		engine.SetWebSetupFunc(func() (int, string, bool, error) {
-			mgmtToken := core.GenerateToken(16)
-			bridgeToken := core.GenerateToken(16)
-			result, err := config.EnableWebAdmin(mgmtToken, bridgeToken)
-			if err != nil {
-				return 0, "", false, err
-			}
-			return result.ManagementPort, result.ManagementToken, !result.AlreadyEnabled, nil
-		})
-		engine.SetWebStatusFunc(func() string {
-			if cfg.Management.Enabled == nil || !*cfg.Management.Enabled {
-				return ""
-			}
-			port := cfg.Management.Port
-			if port == 0 {
-				port = 9820
-			}
-			return fmt.Sprintf("http://localhost:%d", port)
-		})
-
-		engines = append(engines, engine)
-		effectiveWorkDirs = append(effectiveWorkDirs, effectiveWorkDir)
+		projectRuntimes = append(projectRuntimes, runtime)
+		registeredProjects[runtime.project.Name] = struct{}{}
 	}
 
 	// Start cron scheduler
@@ -674,31 +213,31 @@ func main() {
 		if cfg.Cron.SessionMode != "" {
 			cronSched.SetDefaultSessionMode(cfg.Cron.SessionMode)
 		}
-		for i, e := range engines {
-			cronSched.RegisterEngine(cfg.Projects[i].Name, e)
-			e.SetCronScheduler(cronSched)
+		for _, runtime := range projectRuntimes {
+			cronSched.RegisterEngine(runtime.project.Name, runtime.engine)
+			runtime.engine.SetCronScheduler(cronSched)
 		}
 	}
 
 	// Start heartbeat scheduler
 	heartbeatSched := core.NewHeartbeatScheduler(cfg.DataDir)
-	for i, proj := range cfg.Projects {
-		hbCfg := buildHeartbeatConfig(proj.Heartbeat)
+	for _, runtime := range projectRuntimes {
+		hbCfg := buildHeartbeatConfig(runtime.project.Heartbeat)
 		if hbCfg.Enabled {
-			heartbeatSched.Register(proj.Name, hbCfg, engines[i], effectiveWorkDirs[i])
+			heartbeatSched.Register(runtime.project.Name, hbCfg, runtime.engine, runtime.effectiveWorkDir)
 		}
-		engines[i].SetHeartbeatScheduler(heartbeatSched)
+		runtime.engine.SetHeartbeatScheduler(heartbeatSched)
 	}
 
 	var startErrors []error
-	for _, e := range engines {
-		if err := e.Start(); err != nil {
+	for _, runtime := range projectRuntimes {
+		if err := runtime.engine.Start(); err != nil {
 			slog.Warn("engine start partially failed (some platforms may be unavailable)", "error", err)
 			startErrors = append(startErrors, err)
 		}
 	}
 	// Only exit if ALL engines failed to start
-	if len(startErrors) > 0 && len(startErrors) == len(engines) {
+	if len(startErrors) > 0 && len(startErrors) == len(projectRuntimes) {
 		slog.Error("all engines failed to start, exiting")
 		os.Exit(1)
 	}
@@ -723,10 +262,10 @@ func main() {
 			path = "/bridge/ws"
 		}
 		bridgeSrv = core.NewBridgeServer(port, cfg.Bridge.Token, path, cfg.Bridge.CORSOrigins)
-		for i, e := range engines {
-			bp := bridgeSrv.NewPlatform(cfg.Projects[i].Name)
-			bridgeSrv.RegisterEngine(cfg.Projects[i].Name, e, bp)
-			e.AddPlatform(bp)
+		for _, runtime := range projectRuntimes {
+			bp := bridgeSrv.NewPlatform(runtime.project.Name)
+			bridgeSrv.RegisterEngine(runtime.project.Name, runtime.engine, bp)
+			runtime.engine.AddPlatform(bp)
 		}
 		bridgeSrv.Start()
 	}
@@ -743,22 +282,23 @@ func main() {
 			path = "/hook"
 		}
 		webhookSrv = core.NewWebhookServer(port, cfg.Webhook.Token, path)
-		for i, e := range engines {
-			webhookSrv.RegisterEngine(cfg.Projects[i].Name, e)
+		for _, runtime := range projectRuntimes {
+			webhookSrv.RegisterEngine(runtime.project.Name, runtime.engine)
 		}
 		webhookSrv.Start()
 	}
 
 	// Start management API server if enabled
 	var mgmtSrv *core.ManagementServer
+	var apiSrv *core.APIServer
 	if cfg.Management.Enabled != nil && *cfg.Management.Enabled {
 		port := cfg.Management.Port
 		if port <= 0 {
 			port = 9820
 		}
 		mgmtSrv = core.NewManagementServer(port, cfg.Management.Token, cfg.Management.CORSOrigins)
-		for i, e := range engines {
-			mgmtSrv.RegisterEngine(cfg.Projects[i].Name, e)
+		for _, runtime := range projectRuntimes {
+			mgmtSrv.RegisterEngine(runtime.project.Name, runtime.engine)
 		}
 		if cronSched != nil {
 			mgmtSrv.SetCronScheduler(cronSched)
@@ -816,12 +356,20 @@ func main() {
 			}
 			return config.AddPlatformToProject(projectName, config.PlatformConfig{Type: platType, Options: opts}, workDir, agentType)
 		})
-		mgmtSrv.SetCreateProject(func(projectName, workDir, agentType string) error {
-			return config.AddWebProject(projectName, workDir, agentType)
+		mgmtSrv.SetCreateProject(func(projectName, displayName, workDir, agentType string) (string, bool, error) {
+			createdName, err := config.AddWebProject(projectName, displayName, workDir, agentType)
+			if err != nil {
+				return "", false, err
+			}
+			if err := registerProjectRuntime(configPath, createdName, cfg, &projectRuntimes, registeredProjects, cronSched, heartbeatSched, bridgeSrv, webhookSrv, mgmtSrv, apiSrv, *observeFlag, *observeChannel); err != nil {
+				return createdName, false, err
+			}
+			return createdName, false, nil
 		})
 		mgmtSrv.SetRemoveProject(config.RemoveProject)
 		mgmtSrv.SetSaveProjectSettings(func(name string, u core.ProjectSettingsUpdate) error {
 			return config.SaveProjectSettings(name, config.ProjectSettingsUpdate{
+				DisplayName:          u.DisplayName,
 				Language:             u.Language,
 				AdminFrom:            u.AdminFrom,
 				DisabledCommands:     u.DisabledCommands,
@@ -909,7 +457,7 @@ func main() {
 	}
 
 	// Start internal API server for CLI send
-	apiSrv, err := core.NewAPIServer(cfg.DataDir)
+	apiSrv, err = core.NewAPIServer(cfg.DataDir)
 	if err != nil {
 		slog.Warn("api server unavailable", "error", err)
 	} else {
@@ -927,15 +475,14 @@ func main() {
 		// Create shared DirHistory for all engines
 		dirHistory := core.NewDirHistory(cfg.DataDir)
 
-		for i, e := range engines {
-			apiSrv.RegisterEngine(cfg.Projects[i].Name, e)
-			e.SetRelayManager(relayMgr)
-			e.SetDirHistory(dirHistory)
+		for _, runtime := range projectRuntimes {
+			apiSrv.RegisterEngine(runtime.project.Name, runtime.engine)
+			runtime.engine.SetRelayManager(relayMgr)
+			runtime.engine.SetDirHistory(dirHistory)
 
-			// Ensure initial work_dir is in history
-			if initWorkDir := effectiveWorkDirs[i]; initWorkDir != "" {
-				if !dirHistory.Contains(cfg.Projects[i].Name, initWorkDir) {
-					dirHistory.Add(cfg.Projects[i].Name, initWorkDir)
+			if initWorkDir := runtime.effectiveWorkDir; initWorkDir != "" {
+				if !dirHistory.Contains(runtime.project.Name, initWorkDir) {
+					dirHistory.Add(runtime.project.Name, initWorkDir)
 				}
 			}
 		}
@@ -945,13 +492,13 @@ func main() {
 		apiSrv.Start()
 	}
 
-	slog.Info("cc-connect is running", "projects", len(engines))
+	slog.Info("cc-connect is running", "projects", len(projectRuntimes))
 
 	// After startup, check if we were restarted and send success notification
 	if notify := core.ConsumeRestartNotify(cfg.DataDir); notify != nil {
 		slog.Info("post-restart: sending success notification", "platform", notify.Platform, "session", notify.SessionKey)
-		for _, e := range engines {
-			e.SendRestartNotification(notify.Platform, notify.SessionKey)
+		for _, runtime := range projectRuntimes {
+			runtime.engine.SendRestartNotification(notify.Platform, notify.SessionKey)
 		}
 	}
 
@@ -983,8 +530,8 @@ func main() {
 	if apiSrv != nil {
 		apiSrv.Stop()
 	}
-	for _, e := range engines {
-		if err := e.Stop(); err != nil {
+	for _, runtime := range projectRuntimes {
+		if err := runtime.engine.Stop(); err != nil {
 			slog.Error("shutdown error", "error", err)
 		}
 	}
@@ -1410,6 +957,504 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	slog.Info("config reloaded", "project", projName)
 	return result, nil
+}
+
+func buildProjectRuntime(cfg *config.Config, proj config.ProjectConfig, configPath string, observeEnabled bool, observeChannel string) (*projectRuntime, error) {
+	if proj.RunAsUser != "" {
+		if proj.Agent.Options == nil {
+			proj.Agent.Options = map[string]any{}
+		}
+		proj.Agent.Options["run_as_user"] = proj.RunAsUser
+		if len(proj.RunAsEnv) > 0 {
+			proj.Agent.Options["run_as_env"] = proj.RunAsEnv
+		}
+	}
+
+	agent, err := core.CreateAgent(proj.Agent.Type, buildAgentOptions(cfg.DataDir, proj))
+	if err != nil {
+		return nil, fmt.Errorf("create agent: %w", err)
+	}
+
+	providerWiring := wireAgentProviders(agent, proj.Agent)
+
+	var platforms []core.Platform
+	for _, pc := range proj.Platforms {
+		opts := make(map[string]any, len(pc.Options)+2)
+		for k, v := range pc.Options {
+			opts[k] = v
+		}
+		opts["cc_data_dir"] = cfg.DataDir
+		opts["cc_project"] = proj.Name
+		p, err := core.CreatePlatform(pc.Type, opts)
+		if err != nil {
+			return nil, fmt.Errorf("create platform %q: %w", pc.Type, err)
+		}
+		platforms = append(platforms, p)
+	}
+
+	workDir, _ := proj.Agent.Options["work_dir"].(string)
+	projectState := core.NewProjectStateStore(projectStatePath(cfg.DataDir, proj.Name))
+	effectiveWorkDir := applyProjectStateOverride(proj.Name, agent, workDir, projectState)
+	startInitialRefreshIfReady(agent, providerWiring)
+	sessionFile := sessionStorePath(cfg.DataDir, proj.Name, effectiveWorkDir)
+
+	lang := parseLanguage(cfg.Language)
+	engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+	engine.SetDisplayName(proj.DisplayName)
+	showCtx := true
+	if proj.ShowContextIndicator != nil {
+		showCtx = *proj.ShowContextIndicator
+	}
+	engine.SetShowContextIndicator(showCtx)
+	showFooter := true
+	if proj.ReplyFooter != nil {
+		showFooter = *proj.ReplyFooter
+	}
+	engine.SetReplyFooterEnabled(showFooter)
+	engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
+	engine.SetBaseWorkDir(workDir)
+	engine.SetProjectStateStore(projectState)
+
+	if proj.Mode == "multi-workspace" {
+		baseDir := proj.BaseDir
+		if strings.HasPrefix(baseDir, "~/") {
+			home, _ := os.UserHomeDir()
+			baseDir = filepath.Join(home, baseDir[2:])
+		}
+		if err := os.MkdirAll(baseDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create base_dir: %w", err)
+		}
+		bindingStore := filepath.Join(cfg.DataDir, "workspace_bindings.json")
+		engine.SetMultiWorkspace(baseDir, bindingStore)
+		slog.Info("multi-workspace mode enabled", "project", proj.Name, "base_dir", baseDir)
+	}
+
+	obsEnabled := observeEnabled
+	obsChan := observeChannel
+	if proj.Observe != nil {
+		if !obsEnabled && proj.Observe.Enabled {
+			obsEnabled = true
+		}
+		if obsChan == "" && proj.Observe.Channel != "" {
+			obsChan = proj.Observe.Channel
+		}
+	}
+	if obsEnabled {
+		if obsChan == "" {
+			return nil, fmt.Errorf("observe: channel is required")
+		}
+		hasSlack := false
+		for _, p := range platforms {
+			if p.Name() == "slack" {
+				hasSlack = true
+				break
+			}
+		}
+		if !hasSlack {
+			slog.Warn("observe requires a Slack platform; ignoring")
+		} else {
+			projectDir := resolveClaudeProjectDir(workDir)
+			if projectDir == "" {
+				slog.Warn("observe: could not find Claude Code project directory", "workDir", workDir)
+			} else {
+				sessionKey := fmt.Sprintf("slack:%s", obsChan)
+				engine.SetObserveConfig(projectDir, sessionKey)
+			}
+		}
+	}
+
+	for _, c := range cfg.Commands {
+		engine.AddCommand(c.Name, c.Description, c.Prompt, c.Exec, c.WorkDir, "config")
+	}
+	engine.SetCommandSaveAddFunc(func(name, description, prompt, exec, workDir string) error {
+		return config.AddCommand(config.CommandConfig{Name: name, Description: description, Prompt: prompt, Exec: exec, WorkDir: workDir})
+	})
+	engine.SetCommandSaveDelFunc(func(name string) error {
+		return config.RemoveCommand(name)
+	})
+
+	for _, a := range cfg.Aliases {
+		engine.AddAlias(a.Name, a.Command)
+	}
+	engine.SetAliasSaveAddFunc(func(name, command string) error {
+		return config.AddAlias(config.AliasConfig{Name: name, Command: command})
+	})
+	engine.SetAliasSaveDelFunc(func(name string) error {
+		return config.RemoveAlias(name)
+	})
+
+	if len(cfg.BannedWords) > 0 {
+		engine.SetBannedWords(cfg.BannedWords)
+	}
+	if len(proj.DisabledCommands) > 0 {
+		engine.SetDisabledCommands(proj.DisabledCommands)
+	}
+	engine.SetAdminFrom(proj.AdminFrom)
+	if proj.Users != nil {
+		engine.SetUserRoles(buildUserRoleManager(proj.Users))
+	}
+
+	tm, tool, tmlen, toollen := config.EffectiveDisplay(cfg, &proj)
+	engine.SetDisplayConfig(core.DisplayCfg{
+		ThinkingMessages: tm,
+		ThinkingMaxLen:   tmlen,
+		ToolMaxLen:       toollen,
+		ToolMessages:     tool,
+	})
+
+	engine.SetReferenceConfig(core.ReferenceRenderCfg{
+		NormalizeAgents: proj.References.NormalizeAgents,
+		RenderPlatforms: proj.References.RenderPlatforms,
+		DisplayPath:     proj.References.DisplayPath,
+		MarkerStyle:     proj.References.MarkerStyle,
+		EnclosureStyle:  proj.References.EnclosureStyle,
+	})
+
+	spcfg := core.DefaultStreamPreviewCfg()
+	if cfg.StreamPreview.Enabled != nil {
+		spcfg.Enabled = *cfg.StreamPreview.Enabled
+	}
+	if cfg.StreamPreview.IntervalMs != nil {
+		spcfg.IntervalMs = *cfg.StreamPreview.IntervalMs
+	}
+	if cfg.StreamPreview.MinDeltaChars != nil {
+		spcfg.MinDeltaChars = *cfg.StreamPreview.MinDeltaChars
+	}
+	if cfg.StreamPreview.MaxChars != nil {
+		spcfg.MaxChars = *cfg.StreamPreview.MaxChars
+	}
+	if cfg.StreamPreview.DisabledPlatforms != nil {
+		spcfg.DisabledPlatforms = cfg.StreamPreview.DisabledPlatforms
+	}
+	engine.SetStreamPreviewCfg(spcfg)
+
+	maxMsg := 20
+	windowSecs := 60
+	if cfg.RateLimit.MaxMessages != nil {
+		maxMsg = *cfg.RateLimit.MaxMessages
+	}
+	if cfg.RateLimit.WindowSecs != nil {
+		windowSecs = *cfg.RateLimit.WindowSecs
+	}
+	if maxMsg > 0 {
+		engine.SetRateLimitCfg(core.RateLimitCfg{MaxMessages: maxMsg, Window: time.Duration(windowSecs) * time.Second})
+	}
+
+	var maxPS float64
+	if cfg.OutgoingRateLimit.MaxPerSecond != nil {
+		maxPS = *cfg.OutgoingRateLimit.MaxPerSecond
+	}
+	var burst int
+	if cfg.OutgoingRateLimit.Burst != nil {
+		burst = *cfg.OutgoingRateLimit.Burst
+	}
+	defaults := core.OutgoingRateLimitCfg{MaxPerSecond: maxPS, Burst: burst}
+	overrides := make(map[string]core.OutgoingRateLimitCfg)
+	for name, pc := range cfg.OutgoingRateLimit.Platforms {
+		var mps float64
+		if pc.MaxPerSecond != nil {
+			mps = *pc.MaxPerSecond
+		}
+		var b int
+		if pc.Burst != nil {
+			b = *pc.Burst
+		}
+		overrides[name] = core.OutgoingRateLimitCfg{MaxPerSecond: mps, Burst: b}
+	}
+	if maxPS > 0 || len(overrides) > 0 {
+		engine.SetOutgoingRateLimitCfg(defaults, overrides)
+	}
+
+	engine.SetDisplaySaveFunc(func(thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error {
+		return config.SaveDisplayConfig(thinkingMessages, thinkingMaxLen, toolMaxLen, toolMessages)
+	})
+
+	if cfg.IdleTimeoutMins != nil {
+		mins := *cfg.IdleTimeoutMins
+		if mins <= 0 {
+			engine.SetEventIdleTimeout(0)
+		} else {
+			engine.SetEventIdleTimeout(time.Duration(mins) * time.Minute)
+		}
+	}
+
+	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
+		minGap := 30 * time.Minute
+		if proj.AutoCompress.MinGapMins != nil {
+			minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
+		}
+		maxTokens := derefInt(proj.AutoCompress.MaxTokens)
+		if maxTokens <= 0 {
+			maxTokens = 12000
+		}
+		engine.SetAutoCompressConfig(true, maxTokens, minGap)
+	}
+	if proj.ResetOnIdleMins != nil {
+		engine.SetResetOnIdle(time.Duration(*proj.ResetOnIdleMins) * time.Minute)
+	}
+	if proj.InjectSender != nil {
+		engine.SetInjectSender(*proj.InjectSender)
+	}
+
+	if cfg.Speech.Enabled {
+		speechCfg := core.SpeechCfg{Enabled: true, Language: cfg.Speech.Language}
+		switch cfg.Speech.Provider {
+		case "groq":
+			apiKey := cfg.Speech.Groq.APIKey
+			model := cfg.Speech.Groq.Model
+			if model == "" {
+				model = "whisper-large-v3-turbo"
+			}
+			if apiKey != "" {
+				speechCfg.STT = core.NewOpenAIWhisper(apiKey, "https://api.groq.com/openai/v1", model)
+			} else {
+				slog.Warn("speech: groq provider enabled but api_key is empty")
+			}
+		case "qwen":
+			apiKey := cfg.Speech.Qwen.APIKey
+			baseURL := cfg.Speech.Qwen.BaseURL
+			model := cfg.Speech.Qwen.Model
+			if apiKey != "" {
+				speechCfg.STT = core.NewQwenASR(apiKey, baseURL, model)
+			} else {
+				slog.Warn("speech: qwen provider enabled but api_key is empty")
+			}
+		case "gemini":
+			apiKey := cfg.Speech.Gemini.APIKey
+			model := cfg.Speech.Gemini.Model
+			if apiKey != "" {
+				speechCfg.STT = core.NewGeminiSTT(apiKey, model)
+			} else {
+				slog.Warn("speech: gemini provider enabled but api_key is empty")
+			}
+		default:
+			apiKey := cfg.Speech.OpenAI.APIKey
+			baseURL := cfg.Speech.OpenAI.BaseURL
+			model := cfg.Speech.OpenAI.Model
+			if apiKey != "" {
+				speechCfg.STT = core.NewOpenAIWhisper(apiKey, baseURL, model)
+			} else {
+				slog.Warn("speech: openai provider enabled but api_key is empty")
+			}
+		}
+		if speechCfg.STT != nil {
+			engine.SetSpeechConfig(speechCfg)
+			slog.Info("speech: enabled", "provider", cfg.Speech.Provider)
+		}
+	}
+
+	if cfg.TTS.Enabled {
+		ttsCfg := &core.TTSCfg{Enabled: true, Voice: cfg.TTS.Voice, MaxTextLen: cfg.TTS.MaxTextLen}
+		initMode := cfg.TTS.TTSMode
+		switch initMode {
+		case "always", "voice_only":
+		case "":
+			initMode = "voice_only"
+		default:
+			slog.Warn("tts: invalid tts_mode in config, falling back to voice_only", "tts_mode", initMode)
+			initMode = "voice_only"
+		}
+		ttsCfg.SetTTSMode(initMode)
+		switch cfg.TTS.Provider {
+		case "qwen":
+			apiKey := cfg.TTS.Qwen.APIKey
+			baseURL := cfg.TTS.Qwen.BaseURL
+			model := cfg.TTS.Qwen.Model
+			if apiKey != "" {
+				ttsCfg.TTS = core.NewQwenTTS(apiKey, baseURL, model, nil)
+				ttsCfg.Provider = "qwen"
+			} else {
+				slog.Warn("tts: qwen provider enabled but api_key is empty")
+			}
+		case "minimax":
+			apiKey := cfg.TTS.MiniMax.APIKey
+			baseURL := cfg.TTS.MiniMax.BaseURL
+			model := cfg.TTS.MiniMax.Model
+			if apiKey != "" {
+				ttsCfg.TTS = core.NewMiniMaxTTS(apiKey, baseURL, model, nil)
+				ttsCfg.Provider = "minimax"
+			} else {
+				slog.Warn("tts: minimax provider enabled but api_key is empty")
+			}
+		case "espeak":
+			voice := cfg.TTS.Voice
+			if voice == "" {
+				voice = "zh"
+			}
+			ttsCfg.TTS = core.NewEspeakTTS("", voice)
+			ttsCfg.Provider = "espeak"
+		case "pico":
+			voice := cfg.TTS.Voice
+			if voice == "" {
+				voice = "zh-CN"
+			}
+			ttsCfg.TTS = core.NewPicoTTS("", voice)
+			ttsCfg.Provider = "pico"
+		case "edge":
+			voice := cfg.TTS.Voice
+			if voice == "" {
+				voice = "zh-CN-XiaoxiaoNeural"
+			}
+			ttsCfg.TTS = core.NewEdgeTTS(voice)
+			ttsCfg.Provider = "edge"
+		default:
+			apiKey := cfg.TTS.OpenAI.APIKey
+			baseURL := cfg.TTS.OpenAI.BaseURL
+			model := cfg.TTS.OpenAI.Model
+			if apiKey != "" {
+				ttsCfg.TTS = core.NewOpenAITTS(apiKey, baseURL, model, nil)
+				ttsCfg.Provider = "openai"
+			} else {
+				slog.Warn("tts: openai provider enabled but api_key is empty")
+			}
+		}
+		if ttsCfg.TTS != nil {
+			engine.SetTTSConfig(ttsCfg)
+			engine.SetTTSSaveFunc(func(mode string) error {
+				return config.SaveTTSMode(mode)
+			})
+			slog.Info("tts: enabled", "provider", ttsCfg.Provider, "voice", ttsCfg.Voice, "mode", initMode)
+		}
+	}
+
+	if lang == core.LangAuto {
+		engine.SetLanguageSaveFunc(func(l core.Language) error {
+			return config.SaveLanguage(string(l))
+		})
+	}
+
+	projName := proj.Name
+	engine.SetProviderSaveFunc(func(providerName string) error {
+		return config.SaveActiveProvider(projName, providerName)
+	})
+	engine.SetProviderAddSaveFunc(func(p core.ProviderConfig) error {
+		return config.AddProviderToConfig(projName, config.ProviderConfig{
+			Name: p.Name, APIKey: p.APIKey, BaseURL: p.BaseURL,
+			Model: p.Model, Models: convertCoreModels(p.Models), Thinking: p.Thinking, Env: p.Env,
+		})
+	})
+	engine.SetProviderRemoveSaveFunc(func(name string) error {
+		return config.RemoveProviderFromConfig(projName, name)
+	})
+	engine.SetProviderModelSaveFunc(func(providerName, model string) error {
+		return config.SaveProviderModel(projName, providerName, model)
+	})
+	engine.SetModelSaveFunc(func(model string) error {
+		return config.SaveAgentModel(projName, model)
+	})
+
+	capturedEngine := engine
+	capturedProjName := projName
+	engine.SetConfigReloadFunc(func() (*core.ConfigReloadResult, error) {
+		return reloadConfig(configPath, capturedProjName, capturedEngine)
+	})
+	engine.SetWebSetupFunc(func() (int, string, bool, error) {
+		mgmtToken := core.GenerateToken(16)
+		bridgeToken := core.GenerateToken(16)
+		result, err := config.EnableWebAdmin(mgmtToken, bridgeToken)
+		if err != nil {
+			return 0, "", false, err
+		}
+		return result.ManagementPort, result.ManagementToken, !result.AlreadyEnabled, nil
+	})
+	engine.SetWebStatusFunc(func() string {
+		if cfg.Management.Enabled == nil || !*cfg.Management.Enabled {
+			return ""
+		}
+		port := cfg.Management.Port
+		if port == 0 {
+			port = 9820
+		}
+		return fmt.Sprintf("http://localhost:%d", port)
+	})
+
+	return &projectRuntime{project: proj, engine: engine, effectiveWorkDir: effectiveWorkDir}, nil
+}
+
+func registerProjectRuntime(configPath, projectName string, cfg *config.Config, projectRuntimes *[]*projectRuntime, registeredProjects map[string]struct{}, cronSched *core.CronScheduler, heartbeatSched *core.HeartbeatScheduler, bridgeSrv *core.BridgeServer, webhookSrv *core.WebhookServer, mgmtSrv *core.ManagementServer, apiSrv *core.APIServer, observeEnabled bool, observeChannel string) error {
+	if _, exists := registeredProjects[projectName]; exists {
+		return nil
+	}
+
+	reloaded, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("reload config for project registration: %w", err)
+	}
+	*cfg = *reloaded
+
+	var proj *config.ProjectConfig
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name == projectName {
+			proj = &cfg.Projects[i]
+			break
+		}
+	}
+	if proj == nil {
+		return fmt.Errorf("project %q not found after config save", projectName)
+	}
+
+	runtime, err := buildProjectRuntime(cfg, *proj, configPath, observeEnabled, observeChannel)
+	if err != nil {
+		return err
+	}
+	if err := runtime.engine.Start(); err != nil {
+		return fmt.Errorf("start engine: %w", err)
+	}
+
+	if cronSched != nil {
+		cronSched.RegisterEngine(runtime.project.Name, runtime.engine)
+		runtime.engine.SetCronScheduler(cronSched)
+	}
+	if heartbeatSched != nil {
+		hbCfg := buildHeartbeatConfig(runtime.project.Heartbeat)
+		if hbCfg.Enabled {
+			heartbeatSched.Register(runtime.project.Name, hbCfg, runtime.engine, runtime.effectiveWorkDir)
+		}
+		runtime.engine.SetHeartbeatScheduler(heartbeatSched)
+	}
+	if bridgeSrv != nil {
+		bp := bridgeSrv.NewPlatform(runtime.project.Name)
+		bridgeSrv.RegisterEngine(runtime.project.Name, runtime.engine, bp)
+		runtime.engine.AddPlatform(bp)
+	}
+	if webhookSrv != nil {
+		webhookSrv.RegisterEngine(runtime.project.Name, runtime.engine)
+	}
+	if mgmtSrv != nil {
+		mgmtSrv.RegisterEngine(runtime.project.Name, runtime.engine)
+	}
+	if apiSrv != nil {
+		apiSrv.RegisterEngine(runtime.project.Name, runtime.engine)
+		if relayMgr := apiSrv.RelayManager(); relayMgr != nil {
+			runtime.engine.SetRelayManager(relayMgr)
+		}
+		dirHistory := core.NewDirHistory(cfg.DataDir)
+		runtime.engine.SetDirHistory(dirHistory)
+		if initWorkDir := runtime.effectiveWorkDir; initWorkDir != "" && !dirHistory.Contains(runtime.project.Name, initWorkDir) {
+			dirHistory.Add(runtime.project.Name, initWorkDir)
+		}
+	}
+
+	*projectRuntimes = append(*projectRuntimes, runtime)
+	registeredProjects[runtime.project.Name] = struct{}{}
+	return nil
+}
+
+func parseLanguage(raw string) core.Language {
+	switch raw {
+	case "zh", "chinese":
+		return core.LangChinese
+	case "zh-TW", "zh_TW", "zhtw":
+		return core.LangTraditionalChinese
+	case "ja", "japanese":
+		return core.LangJapanese
+	case "es", "spanish":
+		return core.LangSpanish
+	case "en", "english":
+		return core.LangEnglish
+	default:
+		return core.LangAuto
+	}
 }
 
 func buildUserRoleManager(uc *config.UsersConfig) *core.UserRoleManager {

@@ -135,6 +135,57 @@ func TestSessionManager_SessionNames(t *testing.T) {
 	}
 }
 
+func TestSessionAliasPersistence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+
+	sm := NewSessionManager(path)
+	s := sm.NewSession("user1", "")
+	if ok := sm.SetSessionAlias(s.ID, SessionAliasModeProjectSuffix, "规划需求", "项目A · 规划需求"); !ok {
+		t.Fatal("SetSessionAlias returned false")
+	}
+	if got := sm.FindByID(s.ID); got == nil {
+		t.Fatal("session missing after alias set")
+	} else {
+		mode, suffix := got.AliasInfo()
+		if mode != SessionAliasModeProjectSuffix || suffix != "规划需求" {
+			t.Fatalf("AliasInfo = %q/%q, want %q/%q", mode, suffix, SessionAliasModeProjectSuffix, "规划需求")
+		}
+		if got.GetName() != "项目A · 规划需求" {
+			t.Fatalf("GetName = %q", got.GetName())
+		}
+	}
+
+	sm2 := NewSessionManager(path)
+	reloaded := sm2.FindByID(s.ID)
+	if reloaded == nil {
+		t.Fatal("reloaded session missing")
+	}
+	mode, suffix := reloaded.AliasInfo()
+	if mode != SessionAliasModeProjectSuffix || suffix != "规划需求" {
+		t.Fatalf("reloaded AliasInfo = %q/%q, want %q/%q", mode, suffix, SessionAliasModeProjectSuffix, "规划需求")
+	}
+	if reloaded.GetName() != "项目A · 规划需求" {
+		t.Fatalf("reloaded GetName = %q", reloaded.GetName())
+	}
+}
+
+func TestSessionManager_SetSessionNameUpdatesMatchedSession(t *testing.T) {
+	sm := NewSessionManager("")
+	s := sm.NewSession("user1", "旧名字")
+	s.SetAgentSessionID("agent-123", "claude")
+
+	sm.SetSessionName("agent-123", "新名字")
+
+	if got := s.GetName(); got != "新名字" {
+		t.Fatalf("GetName = %q, want 新名字", got)
+	}
+	mode, _ := s.AliasInfo()
+	if mode != SessionAliasModeManual {
+		t.Fatalf("AliasMode = %q, want %q", mode, SessionAliasModeManual)
+	}
+}
+
 func TestSessionManager_Persistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sessions.json")

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -38,16 +40,16 @@ func isValidRunAsUserName(name string) bool {
 }
 
 var dangerousEnvVars = map[string]bool{
-	"LD_PRELOAD":           true,
-	"LD_LIBRARY_PATH":      true,
+	"LD_PRELOAD":            true,
+	"LD_LIBRARY_PATH":       true,
 	"DYLD_INSERT_LIBRARIES": true,
-	"DYLD_LIBRARY_PATH":    true,
-	"PATH":                 true,
-	"HOME":                 true,
-	"USER":                 true,
-	"SHELL":                true,
-	"SUDO_USER":            true,
-	"SUDO_COMMAND":         true,
+	"DYLD_LIBRARY_PATH":     true,
+	"PATH":                  true,
+	"HOME":                  true,
+	"USER":                  true,
+	"SHELL":                 true,
+	"SUDO_USER":             true,
+	"SUDO_COMMAND":          true,
 }
 
 func validateRunAsEnv(prefix string, envVars []string) error {
@@ -87,27 +89,27 @@ type Config struct {
 	AttachmentSend string `toml:"attachment_send"`
 	// Quiet is legacy: when true and [display] does not set thinking_messages / tool_messages,
 	// engines behave as if those flags were false. Per-project quiet overrides when set.
-	Quiet             *bool                   `toml:"quiet,omitempty"`
-	Providers         []ProviderConfig        `toml:"providers"`          // global shared providers
-	ProviderPresetsURL string                 `toml:"provider_presets_url,omitempty"` // remote JSON URL for provider presets
-	Projects          []ProjectConfig         `toml:"projects"`
-	Commands          []CommandConfig         `toml:"commands"`     // global custom slash commands
-	Aliases           []AliasConfig           `toml:"aliases"`      // global command aliases
-	BannedWords       []string                `toml:"banned_words"` // messages containing any of these words are blocked
-	Log               LogConfig               `toml:"log"`
-	Language          string                  `toml:"language"` // "en" or "zh", default is "en"
-	Speech            SpeechConfig            `toml:"speech"`
-	TTS               TTSConfig               `toml:"tts"`
-	Display           DisplayConfig           `toml:"display"`
-	StreamPreview     StreamPreviewConfig     `toml:"stream_preview"`      // real-time streaming preview
-	RateLimit         RateLimitConfig         `toml:"rate_limit"`          // per-session rate limiting
-	OutgoingRateLimit OutgoingRateLimitConfig `toml:"outgoing_rate_limit"` // outgoing message throttling
-	Relay             RelayConfig             `toml:"relay"`               // bot-to-bot relay behavior
-	Cron              CronConfig              `toml:"cron"`
-	Webhook           WebhookConfig           `toml:"webhook"`
-	Bridge            BridgeConfig            `toml:"bridge"`
-	Management        ManagementConfig        `toml:"management"`
-	IdleTimeoutMins   *int                    `toml:"idle_timeout_mins,omitempty"` // max minutes between agent events; 0 = no timeout; default 120
+	Quiet              *bool                   `toml:"quiet,omitempty"`
+	Providers          []ProviderConfig        `toml:"providers"`                      // global shared providers
+	ProviderPresetsURL string                  `toml:"provider_presets_url,omitempty"` // remote JSON URL for provider presets
+	Projects           []ProjectConfig         `toml:"projects"`
+	Commands           []CommandConfig         `toml:"commands"`     // global custom slash commands
+	Aliases            []AliasConfig           `toml:"aliases"`      // global command aliases
+	BannedWords        []string                `toml:"banned_words"` // messages containing any of these words are blocked
+	Log                LogConfig               `toml:"log"`
+	Language           string                  `toml:"language"` // "en" or "zh", default is "en"
+	Speech             SpeechConfig            `toml:"speech"`
+	TTS                TTSConfig               `toml:"tts"`
+	Display            DisplayConfig           `toml:"display"`
+	StreamPreview      StreamPreviewConfig     `toml:"stream_preview"`      // real-time streaming preview
+	RateLimit          RateLimitConfig         `toml:"rate_limit"`          // per-session rate limiting
+	OutgoingRateLimit  OutgoingRateLimitConfig `toml:"outgoing_rate_limit"` // outgoing message throttling
+	Relay              RelayConfig             `toml:"relay"`               // bot-to-bot relay behavior
+	Cron               CronConfig              `toml:"cron"`
+	Webhook            WebhookConfig           `toml:"webhook"`
+	Bridge             BridgeConfig            `toml:"bridge"`
+	Management         ManagementConfig        `toml:"management"`
+	IdleTimeoutMins    *int                    `toml:"idle_timeout_mins,omitempty"` // max minutes between agent events; 0 = no timeout; default 120
 }
 
 // CronConfig controls cron job behavior.
@@ -135,10 +137,11 @@ type BridgeConfig struct {
 
 // ManagementConfig controls the HTTP Management API for external tools.
 type ManagementConfig struct {
-	Enabled     *bool    `toml:"enabled"`                // default false
-	Port        int      `toml:"port,omitempty"`         // listen port; default 9820
-	Token       string   `toml:"token,omitempty"`        // shared secret for authentication; required
-	CORSOrigins []string `toml:"cors_origins,omitempty"` // allowed CORS origins; empty = no CORS
+	Enabled                *bool    `toml:"enabled"`                             // default false
+	Port                   int      `toml:"port,omitempty"`                      // listen port; default 9820
+	Token                  string   `toml:"token,omitempty"`                     // shared secret for authentication; required
+	CORSOrigins            []string `toml:"cors_origins,omitempty"`              // allowed CORS origins; empty = no CORS
+	DefaultProjectBasePath string   `toml:"default_project_base_path,omitempty"` // default base path for auto-created web projects
 }
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
@@ -281,6 +284,7 @@ type ReferenceConfig struct {
 // ProjectConfig binds one agent (with a specific work_dir) to one or more platforms.
 type ProjectConfig struct {
 	Name         string             `toml:"name"`
+	DisplayName  string             `toml:"display_name,omitempty"`
 	Mode         string             `toml:"mode,omitempty"`     // "" or "multi-workspace"
 	BaseDir      string             `toml:"base_dir,omitempty"` // parent dir for workspaces
 	Agent        AgentConfig        `toml:"agent"`
@@ -2096,6 +2100,66 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
+const generatedProjectNamePrefixMaxLen = 48
+
+func generateProjectName(cfg *Config, displayName string) (string, error) {
+	existing := make(map[string]struct{}, len(cfg.Projects))
+	for i := range cfg.Projects {
+		existing[cfg.Projects[i].Name] = struct{}{}
+	}
+	prefix := projectNameSlug(displayName)
+	for range 32 {
+		buf := make([]byte, 4)
+		if _, err := rand.Read(buf); err != nil {
+			return "", fmt.Errorf("generate project name: %w", err)
+		}
+		name := prefix + "-" + hex.EncodeToString(buf)
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		return name, nil
+	}
+	return "", fmt.Errorf("generate project name: exhausted retries")
+}
+
+func projectNameSlug(displayName string) string {
+	displayName = strings.ToLower(strings.TrimSpace(displayName))
+	if displayName == "" {
+		return "project"
+	}
+
+	var b strings.Builder
+	b.Grow(len(displayName))
+	pendingDash := false
+	for _, r := range displayName {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			if pendingDash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			b.WriteRune(r)
+			pendingDash = false
+		default:
+			pendingDash = b.Len() > 0
+		}
+		if b.Len() >= generatedProjectNamePrefixMaxLen {
+			break
+		}
+	}
+
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		return "project"
+	}
+	if len(slug) > generatedProjectNamePrefixMaxLen {
+		slug = strings.Trim(slug[:generatedProjectNamePrefixMaxLen], "-")
+		if slug == "" {
+			return "project"
+		}
+	}
+	return slug
+}
+
 type rawProjectSpan struct {
 	start     int
 	end       int
@@ -2308,6 +2372,7 @@ func extractLineComment(line string) string {
 
 // ProjectSettingsUpdate carries optional field updates for SaveProjectSettings.
 type ProjectSettingsUpdate struct {
+	DisplayName          *string
 	Language             *string
 	AdminFrom            *string
 	DisabledCommands     []string
@@ -2342,6 +2407,9 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 			continue
 		}
 		proj := &cfg.Projects[i]
+		if update.DisplayName != nil {
+			proj.DisplayName = strings.TrimSpace(*update.DisplayName)
+		}
 		if update.AdminFrom != nil {
 			proj.AdminFrom = *update.AdminFrom
 		}
@@ -2418,7 +2486,9 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 		if p.Name != projectName {
 			continue
 		}
-		result := map[string]any{}
+		result := map[string]any{
+			"display_name": p.DisplayName,
+		}
 		if p.Agent.Options != nil {
 			if wd, ok := p.Agent.Options["work_dir"].(string); ok && strings.TrimSpace(wd) != "" {
 				result["work_dir"] = wd
@@ -2553,46 +2623,72 @@ func AddPlatformToProject(projectName string, platform PlatformConfig, workDir, 
 
 // AddWebProject appends a new project that is intended to be used only through
 // the bridge/web UI. The bridge must already be enabled in config.toml.
-func AddWebProject(projectName, workDir, agentType string) error {
+func AddWebProject(projectName, displayName, workDir, agentType string) (string, error) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	if ConfigPath == "" {
-		return fmt.Errorf("config path not set")
+		return "", fmt.Errorf("config path not set")
 	}
 	data, err := os.ReadFile(ConfigPath)
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return "", fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
 	if err := toml.Unmarshal(data, cfg); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return "", fmt.Errorf("parse config: %w", err)
+	}
+	projectName = strings.TrimSpace(projectName)
+	displayName = strings.TrimSpace(displayName)
+	if projectName == "" {
+		generated, err := generateProjectName(cfg, displayName)
+		if err != nil {
+			return "", err
+		}
+		projectName = generated
 	}
 	for i := range cfg.Projects {
 		if cfg.Projects[i].Name == projectName {
-			return fmt.Errorf("project %q already exists", projectName)
+			return "", fmt.Errorf("project %q already exists", projectName)
 		}
 	}
 	if cfg.Bridge.Enabled == nil || !*cfg.Bridge.Enabled {
-		return fmt.Errorf("bridge must be enabled for web-only projects")
+		return "", fmt.Errorf("bridge must be enabled for web-only projects")
+	}
+
+	wd := strings.TrimSpace(workDir)
+	if wd == "" {
+		basePath := strings.TrimSpace(cfg.Management.DefaultProjectBasePath)
+		if basePath == "" {
+			return "", fmt.Errorf("work_dir is required when management.default_project_base_path is not configured")
+		}
+		if !filepath.IsAbs(basePath) {
+			return "", fmt.Errorf("management.default_project_base_path must be an absolute path")
+		}
+		wd = filepath.Join(basePath, projectName)
+	}
+	wd = filepath.Clean(wd)
+	if err := os.MkdirAll(wd, 0o755); err != nil {
+		return "", fmt.Errorf("create work_dir %q: %w", wd, err)
 	}
 
 	agentCfg := pickAgentTemplateForNewProject(cfg, EnsureProjectWithFeishuOptions{
-		WorkDir:   workDir,
+		WorkDir:   wd,
 		AgentType: agentType,
 	})
-	wd := strings.TrimSpace(workDir)
-	if wd != "" {
-		if agentCfg.Options == nil {
-			agentCfg.Options = map[string]any{}
-		}
-		agentCfg.Options["work_dir"] = wd
+	if agentCfg.Options == nil {
+		agentCfg.Options = map[string]any{}
 	}
+	agentCfg.Options["work_dir"] = wd
 
 	cfg.Projects = append(cfg.Projects, ProjectConfig{
-		Name:  projectName,
-		Agent: agentCfg,
+		Name:        projectName,
+		DisplayName: displayName,
+		Agent:       agentCfg,
 	})
-	return saveConfig(cfg)
+	if err := saveConfig(cfg); err != nil {
+		return "", err
+	}
+	return projectName, nil
 }
 
 func writeRawConfig(content string) error {

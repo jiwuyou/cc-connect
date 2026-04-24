@@ -48,6 +48,7 @@ type HeartbeatScheduler struct {
 	mu        sync.Mutex
 	entries   map[string]*heartbeatEntry // project name → entry
 	stopCh    chan struct{}
+	started   bool
 	stopped   bool
 	stateFile string // path to heartbeat_state.json; empty = no persistence
 }
@@ -114,12 +115,19 @@ func (hs *HeartbeatScheduler) Register(project string, cfg HeartbeatConfig, engi
 	}
 
 	hs.entries[project] = entry
+	if hs.started && !hs.stopped {
+		hs.startEntry(entry)
+	}
 }
 
 // Start begins all registered heartbeat tickers.
 func (hs *HeartbeatScheduler) Start() {
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
+	if hs.started || hs.stopped {
+		return
+	}
+	hs.started = true
 	for _, entry := range hs.entries {
 		hs.startEntry(entry)
 	}

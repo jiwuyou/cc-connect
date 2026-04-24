@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -148,6 +149,7 @@ type RateLimitCfg struct {
 // Engine routes messages between platforms and the agent for a single project.
 type Engine struct {
 	name                  string
+	displayName           string
 	agent                 Agent
 	platforms             []Platform
 	sessions              *SessionManager
@@ -857,6 +859,153 @@ func (e *Engine) SetDirHistory(dh *DirHistory) {
 
 func (e *Engine) SetBaseWorkDir(dir string) {
 	e.baseWorkDir = dir
+}
+
+func (e *Engine) SetDisplayName(name string) {
+	e.displayName = name
+}
+
+func (e *Engine) DisplayName() string {
+	if strings.TrimSpace(e.displayName) != "" {
+		return e.displayName
+	}
+	return e.name
+}
+
+func (e *Engine) sessionProjectDisplayName() string {
+	return strings.TrimSpace(e.DisplayName())
+}
+
+func (e *Engine) sessionDisplayName(s *Session) string {
+	if s == nil {
+		return ""
+	}
+	name := strings.TrimSpace(s.GetName())
+	if name != "" {
+		return name
+	}
+	return e.sessionProjectDisplayName()
+}
+
+func sessionAliasSuffixFromMessage(content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return "新对话"
+	}
+	content = strings.Join(strings.FieldsFunc(content, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	}), " ")
+	content = strings.Join(strings.Fields(content), " ")
+	if content == "" {
+		return "新对话"
+	}
+	maxRunes := 12
+	count := 0
+	var b strings.Builder
+	for _, r := range content {
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+		count++
+		if count >= maxRunes {
+			break
+		}
+	}
+	suffix := strings.TrimSpace(b.String())
+	if suffix == "" {
+		return "新对话"
+	}
+	return suffix
+}
+
+func composeSessionAlias(projectName, suffix string) string {
+	projectName = strings.TrimSpace(projectName)
+	suffix = strings.TrimSpace(suffix)
+	if projectName == "" {
+		return suffix
+	}
+	if suffix == "" {
+		return projectName
+	}
+	return projectName + " · " + suffix
+}
+
+func (e *Engine) syncSessionAliases(sessions *SessionManager, sessionKey string) {
+	projectName := e.sessionProjectDisplayName()
+	list := sessions.ListSessions(sessionKey)
+	if len(list) == 0 {
+		return
+	}
+	if len(list) == 1 {
+		s := list[0]
+		aliasMode, suffix := s.AliasInfo()
+		if aliasMode == "" || aliasMode == SessionAliasModeProjectSync || aliasMode == SessionAliasModeProjectSuffix {
+			sessions.SetSessionAlias(s.ID, SessionAliasModeProjectSync, suffix, projectName)
+		}
+		return
+	}
+	for _, s := range list {
+		aliasMode, suffix := s.AliasInfo()
+		switch aliasMode {
+		case SessionAliasModeManual:
+			continue
+		case SessionAliasModeProjectSuffix:
+			if strings.TrimSpace(suffix) == "" {
+				suffix = sessionAliasSuffixFromMessage(s.GetName())
+			}
+			sessions.SetSessionAlias(s.ID, SessionAliasModeProjectSuffix, suffix, composeSessionAlias(projectName, suffix))
+		case SessionAliasModeProjectSync, "":
+			suffix = strings.TrimSpace(suffix)
+			if suffix == "" {
+				suffix = sessionAliasSuffixFromMessage(s.GetName())
+			}
+			sessions.SetSessionAlias(s.ID, SessionAliasModeProjectSuffix, suffix, composeSessionAlias(projectName, suffix))
+		}
+	}
+}
+
+func (e *Engine) ensureSessionAlias(session *Session, sessions *SessionManager, sessionKey, firstMessage string) {
+	if session == nil || sessions == nil {
+		return
+	}
+	currentName := strings.TrimSpace(session.GetName())
+	aliasMode, aliasSuffix := session.AliasInfo()
+	if aliasMode == SessionAliasModeManual {
+		return
+	}
+	list := sessions.ListSessions(sessionKey)
+	projectName := e.sessionProjectDisplayName()
+	if len(list) <= 1 {
+		if aliasMode == "" || aliasMode == SessionAliasModeProjectSync || currentName == "" || currentName == "default" {
+			if strings.TrimSpace(aliasSuffix) == "" {
+				aliasSuffix = sessionAliasSuffixFromMessage(firstMessage)
+			}
+			sessions.SetSessionAlias(session.ID, SessionAliasModeProjectSync, aliasSuffix, projectName)
+		}
+		return
+	}
+	suffix := strings.TrimSpace(aliasSuffix)
+	if suffix == "" {
+		suffix = sessionAliasSuffixFromMessage(firstMessage)
+	}
+	sessions.SetSessionAlias(session.ID, SessionAliasModeProjectSuffix, suffix, composeSessionAlias(projectName, suffix))
+	for _, s := range list {
+		if s.ID == session.ID {
+			continue
+		}
+		otherMode, otherSuffix := s.AliasInfo()
+		if otherMode == SessionAliasModeManual {
+			continue
+		}
+		if otherMode == "" && strings.TrimSpace(otherSuffix) == "" {
+			continue
+		}
+		if strings.TrimSpace(otherSuffix) == "" {
+			otherSuffix = sessionAliasSuffixFromMessage(s.GetName())
+		}
+		sessions.SetSessionAlias(s.ID, SessionAliasModeProjectSuffix, otherSuffix, composeSessionAlias(projectName, otherSuffix))
+	}
 }
 
 func (e *Engine) SetProjectStateStore(store *ProjectStateStore) {
@@ -2024,7 +2173,11 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	turnStart := time.Now()
 
 	e.i18n.DetectAndSet(msg.Content)
+	wasFirstMessage := len(session.GetHistory(1)) == 0
 	session.AddHistory("user", msg.Content)
+	if wasFirstMessage {
+		e.ensureSessionAlias(session, sessions, msg.SessionKey, msg.Content)
+	}
 
 	// Use the agent override when available (multi-workspace mode)
 	var agentOverride Agent
@@ -2756,9 +2909,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 			if event.SessionID != "" {
 				if session.CompareAndSetAgentSessionID(event.SessionID, e.agent.Name()) {
-					pendingName := session.GetName()
-					if pendingName != "" && pendingName != "session" && pendingName != "default" {
-						sessions.SetSessionName(event.SessionID, pendingName)
+					if aliasMode, _ := session.AliasInfo(); aliasMode == SessionAliasModeManual {
+						pendingName := session.GetName()
+						if pendingName != "" && pendingName != "session" && pendingName != "default" {
+							sessions.SetSessionName(event.SessionID, pendingName)
+						}
 					}
 					sessions.Save()
 				}
@@ -3761,10 +3916,13 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 	if len(args) > 0 {
 		name = strings.Join(args, " ")
 	}
-	sessions.NewSession(msg.SessionKey, name)
-	if name != "" {
+	created := sessions.NewSession(msg.SessionKey, name)
+	if strings.TrimSpace(name) != "" {
+		created.SetManualName(name)
+		sessions.Save()
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNewSessionCreatedName), name))
 	} else {
+		e.syncSessionAliases(sessions, msg.SessionKey)
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNewSessionCreated))
 	}
 }
@@ -3915,6 +4073,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 
 	session := sessions.SwitchToAgentSession(msg.SessionKey, matched.ID, agent.Name(), matched.Summary)
 	session.ClearHistory()
+	e.ensureSessionAlias(session, sessions, msg.SessionKey, matched.Summary)
 
 	shortID := matched.ID
 	if len(shortID) > 12 {
@@ -4766,7 +4925,12 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 		return
 	}
 
-	sessions.SetSessionName(targetID, name)
+	current := sessions.GetOrCreateActive(msg.SessionKey)
+	if targetID == current.GetAgentSessionID() {
+		sessions.SetSessionManualName(current.ID, name)
+	} else {
+		sessions.SetSessionName(targetID, name)
+	}
 
 	shortID := targetID
 	if len(shortID) > 12 {

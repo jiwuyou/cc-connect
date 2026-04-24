@@ -1,6 +1,7 @@
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  X, MessageSquare, Circle, User, Bot, Plus,
+  X, MessageSquare, Circle, User, Bot, Plus, Pencil, Check, Loader2,
 } from 'lucide-react';
 import { Badge } from '@/components/ui';
 import type { Session } from '@/api/sessions';
@@ -23,11 +24,15 @@ interface Props {
   sessions: Session[];
   currentSessionId: string;
   onSelect: (session: Session) => void;
+  onRename?: (session: Session, name: string) => Promise<void>;
   onNewSession?: () => void;
 }
 
-export default function SessionDrawer({ open, onClose, sessions, currentSessionId, onSelect, onNewSession }: Props) {
+export default function SessionDrawer({ open, onClose, sessions, currentSessionId, onSelect, onRename, onNewSession }: Props) {
   const { t } = useTranslation();
+  const [editingId, setEditingId] = useState('');
+  const [draftName, setDraftName] = useState('');
+  const [savingId, setSavingId] = useState('');
 
   return (
     <>
@@ -76,32 +81,99 @@ export default function SessionDrawer({ open, onClose, sessions, currentSessionI
           ) : (
             sessions.map((s) => {
               const isCurrent = s.id === currentSessionId;
+              const isEditing = editingId === s.id;
+              const isSaving = savingId === s.id;
               return (
-                <button
+                <div
                   key={s.id}
-                  type="button"
-                  onClick={() => onSelect(s)}
                   className={cn(
-                    'w-full text-left p-3 rounded-xl mb-1 transition-all duration-200',
+                    'p-3 rounded-xl mb-1 transition-all duration-200',
                     isCurrent
                       ? 'bg-accent/10 ring-1 ring-accent/30'
                       : 'hover:bg-gray-100/80 dark:hover:bg-white/[0.04]',
                   )}
                 >
                   <div className="flex items-start justify-between gap-2 mb-1">
-                    <div className="flex items-center gap-1.5 min-w-0">
+                    <button
+                      type="button"
+                      onClick={() => onSelect(s)}
+                      className="flex items-center gap-1.5 min-w-0 flex-1 text-left"
+                    >
                       <MessageSquare
                         size={13}
                         className={cn(s.live ? 'text-accent' : 'text-gray-400', 'shrink-0')}
                       />
-                      <span className="text-sm font-medium text-gray-900 dark:text-white truncate">
-                        {s.name || s.user_name || s.id.slice(0, 8)}
-                      </span>
+                      {isEditing ? (
+                        <input
+                          value={draftName}
+                          onChange={(e) => setDraftName(e.target.value)}
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter' && onRename && draftName.trim()) {
+                              e.preventDefault();
+                              setSavingId(s.id);
+                              try {
+                                await onRename(s, draftName.trim());
+                                setEditingId('');
+                                setDraftName('');
+                              } finally {
+                                setSavingId('');
+                              }
+                            }
+                            if (e.key === 'Escape') {
+                              setEditingId('');
+                              setDraftName('');
+                            }
+                          }}
+                          className="min-w-0 flex-1 px-2 py-1 text-sm rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                          autoFocus
+                        />
+                      ) : (
+                        <span className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                          {s.name || s.user_name || s.id.slice(0, 8)}
+                        </span>
+                      )}
                       {s.live && <Circle size={4} className="fill-emerald-500 text-emerald-500 shrink-0" />}
+                    </button>
+                    <div className="flex items-center gap-1 shrink-0 mt-0.5">
+                      {isEditing && onRename && (
+                        <button
+                          type="button"
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            if (!draftName.trim()) return;
+                            setSavingId(s.id);
+                            try {
+                              await onRename(s, draftName.trim());
+                              setEditingId('');
+                              setDraftName('');
+                            } finally {
+                              setSavingId('');
+                            }
+                          }}
+                          className="p-1 rounded-md text-gray-400 hover:text-accent hover:bg-accent/10 transition-colors"
+                          disabled={isSaving}
+                        >
+                          {isSaving ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                        </button>
+                      )}
+                      {!isEditing && onRename && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingId(s.id);
+                            setDraftName(s.name || s.user_name || '');
+                          }}
+                          className="p-1 rounded-md text-gray-400 hover:text-accent hover:bg-accent/10 transition-colors"
+                        >
+                          <Pencil size={12} />
+                        </button>
+                      )}
+                      <span className="text-[10px] text-gray-400 shrink-0">
+                        {timeAgo(s.updated_at || s.created_at)}
+                      </span>
                     </div>
-                    <span className="text-[10px] text-gray-400 shrink-0 mt-0.5">
-                      {timeAgo(s.updated_at || s.created_at)}
-                    </span>
                   </div>
 
                   {s.last_message && (
@@ -119,7 +191,7 @@ export default function SessionDrawer({ open, onClose, sessions, currentSessionI
                     {s.platform && <Badge variant="info" className="text-[9px] px-1 py-0">{s.platform}</Badge>}
                     <span className="text-[10px] text-gray-400 ml-auto">{s.history_count} msgs</span>
                   </div>
-                </button>
+                </div>
               );
             })
           )}

@@ -8863,6 +8863,86 @@ func TestCmdSwitch_ByName(t *testing.T) {
 	}
 }
 
+func TestEnsureSessionAlias_FirstMessageSingleSession(t *testing.T) {
+	e := NewEngine("internal", &stubAgent{}, nil, "", LangEnglish)
+	e.SetDisplayName("项目别名")
+	s := e.sessions.GetOrCreateActive("test:ch:user1")
+
+	e.ensureSessionAlias(s, e.sessions, "test:ch:user1", "帮我修一下登录页")
+
+	if got := s.GetName(); got != "项目别名" {
+		t.Fatalf("GetName = %q, want 项目别名", got)
+	}
+	mode, suffix := s.AliasInfo()
+	if mode != SessionAliasModeProjectSync || suffix != "帮我修一下登录页" {
+		t.Fatalf("AliasInfo = %q/%q", mode, suffix)
+	}
+}
+
+func TestEnsureSessionAlias_FirstMessageMultipleSessions(t *testing.T) {
+	e := NewEngine("internal", &stubAgent{}, nil, "", LangEnglish)
+	e.SetDisplayName("项目别名")
+	key := "test:ch:user1"
+	first := e.sessions.GetOrCreateActive(key)
+	e.ensureSessionAlias(first, e.sessions, key, "先聊主线")
+	second := e.sessions.NewSession(key, "")
+
+	e.ensureSessionAlias(second, e.sessions, key, "帮我补一下支付回调")
+
+	if got := second.GetName(); got != "项目别名 · 帮我补一下支付回调" {
+		t.Fatalf("second GetName = %q", got)
+	}
+	mode, suffix := second.AliasInfo()
+	if mode != SessionAliasModeProjectSuffix || suffix != "帮我补一下支付回调" {
+		t.Fatalf("second AliasInfo = %q/%q", mode, suffix)
+	}
+	if got := first.GetName(); got != "项目别名 · 先聊主线" {
+		t.Fatalf("first GetName = %q", got)
+	}
+}
+
+func TestSyncSessionAliases_SkipsManualSession(t *testing.T) {
+	e := NewEngine("internal", &stubAgent{}, nil, "", LangEnglish)
+	e.SetDisplayName("旧项目")
+	key := "test:ch:user1"
+	first := e.sessions.GetOrCreateActive(key)
+	e.ensureSessionAlias(first, e.sessions, key, "讨论接口")
+	second := e.sessions.NewSession(key, "")
+	e.ensureSessionAlias(second, e.sessions, key, "处理部署")
+	second.SetManualName("手动名称")
+	e.sessions.Save()
+
+	e.SetDisplayName("新项目")
+	e.syncSessionAliases(e.sessions, key)
+
+	if got := first.GetName(); got != "新项目 · 讨论接口" {
+		t.Fatalf("first GetName = %q", got)
+	}
+	if got := second.GetName(); got != "手动名称" {
+		t.Fatalf("second GetName = %q", got)
+	}
+}
+
+func TestCmdName_CurrentSessionMarksManual(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:ch:user1"
+	s := e.sessions.GetOrCreateActive(key)
+	s.SetAgentSessionID("agent-123", "stub")
+	e.ensureSessionAlias(s, e.sessions, key, "自动标题")
+
+	msg := &Message{SessionKey: key, Content: "/name 手动标题", ReplyCtx: "ctx"}
+	e.handleCommand(p, msg, msg.Content)
+
+	if got := s.GetName(); got != "手动标题" {
+		t.Fatalf("GetName = %q", got)
+	}
+	mode, _ := s.AliasInfo()
+	if mode != SessionAliasModeManual {
+		t.Fatalf("AliasMode = %q", mode)
+	}
+}
+
 // --- 6. /memory ---
 
 type stubMemoryAgentFull struct {

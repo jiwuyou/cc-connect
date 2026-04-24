@@ -4,7 +4,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Server, Heart, ArrowRight, FolderKanban, Plus, Smartphone, Settings2, Globe } from 'lucide-react';
 import { Card, Badge, Button, Input, Modal, EmptyState } from '@/components/ui';
 import { createProject, listProjects, type ProjectSummary } from '@/api/projects';
-import { restartSystem } from '@/api/status';
+import { reloadConfig, restartSystem } from '@/api/status';
 import PlatformSetupQR from './PlatformSetupQR';
 import PlatformManualForm from './PlatformManualForm';
 import { platformMeta } from '@/lib/platformMeta';
@@ -50,6 +50,7 @@ export default function ProjectList() {
   const [selectedPlat, setSelectedPlat] = useState('');
   const [showRestartModal, setShowRestartModal] = useState(false);
   const [creatingWebOnly, setCreatingWebOnly] = useState(false);
+  const [pendingProjectName, setPendingProjectName] = useState('');
 
   const fetch = useCallback(async () => {
     try {
@@ -83,10 +84,19 @@ export default function ProjectList() {
     setSelectedPlat(key);
     if (key === 'web') {
       setCreatingWebOnly(true);
-      createProject({ name: newProjName, work_dir: newWorkDir, agent_type: newAgentType })
-        .then(() => {
+      createProject({ display_name: newProjName, work_dir: newWorkDir, agent_type: newAgentType })
+        .then(async (res) => {
+          setPendingProjectName(res.name || '');
+          await reloadConfig().catch(() => undefined);
+          await fetch();
           setShowWizard(false);
-          setShowRestartModal(true);
+          if (res.restart_required) {
+            setShowRestartModal(true);
+            return;
+          }
+          if (res.name) {
+            navigate(`/projects/${res.name}`);
+          }
         })
         .catch((e: any) => {
           window.alert(e?.message || String(e));
@@ -107,14 +117,23 @@ export default function ProjectList() {
   };
 
   const handleManualDone = async () => {
-    // For non-QR platforms, use feishu EnsureProject to create the project skeleton,
-    // then the user configures platform details from the project detail page.
-    // We use the feishu save endpoint with empty credentials just to create the project.
-    // Actually, let's guide the user to the project detail page to configure.
     setShowWizard(false);
     fetch();
-    navigate(`/projects/${newProjName}`);
   };
+
+  const waitForService = (maxMs: number) =>
+    new Promise<void>((resolve) => {
+      const start = Date.now();
+      const poll = () => {
+        window.fetch('/api/v1/status')
+          .then((r) => { if (r.ok) resolve(); else throw new Error(); })
+          .catch(() => {
+            if (Date.now() - start > maxMs) { resolve(); return; }
+            setTimeout(poll, 500);
+          });
+      };
+      setTimeout(poll, 1500);
+    });
 
   if (loading && projects.length === 0) {
     return <div className="flex items-center justify-center h-64 text-gray-400 animate-pulse">Loading...</div>;
@@ -140,7 +159,7 @@ export default function ProjectList() {
                 <div className="flex items-start justify-between mb-3">
                   <div className="flex items-center gap-2">
                     <Server size={18} className="text-gray-400" />
-                    <h3 className="font-semibold text-gray-900 dark:text-white">{p.name}</h3>
+                    <h3 className="font-semibold text-gray-900 dark:text-white">{p.display_name || p.name}</h3>
                   </div>
                   <ArrowRight size={16} className="text-gray-300 dark:text-gray-600" />
                 </div>
@@ -176,10 +195,10 @@ export default function ProjectList() {
               autoFocus
             />
             <Input
-              label={t('setup.workDir', 'Working directory')}
+              label={t('setup.workDir', 'Working directory (optional)')}
               value={newWorkDir}
               onChange={(e) => setNewWorkDir(e.target.value)}
-              placeholder="/path/to/project"
+              placeholder={t('setup.workDirAuto', 'Auto-create under default base path')}
             />
             <div>
               <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">
@@ -197,7 +216,7 @@ export default function ProjectList() {
             </div>
             <div className="flex justify-end gap-2 pt-2">
               <Button variant="secondary" onClick={() => setShowWizard(false)}>{t('common.cancel')}</Button>
-              <Button disabled={!newProjName.trim() || !newWorkDir.trim()} onClick={() => setWizStep('platform')}>
+              <Button onClick={() => setWizStep('platform')}>
                 {t('setup.next', 'Next')}
               </Button>
             </div>
@@ -279,10 +298,19 @@ export default function ProjectList() {
             {t('setup.restartHint', 'Restart the service for the new platform to take effect.')}
           </p>
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => { setShowRestartModal(false); fetch(); }}>
+            <Button variant="secondary" onClick={() => { setShowRestartModal(false); setPendingProjectName(''); fetch(); }}>
               {t('setup.later', 'Later')}
             </Button>
-            <Button onClick={async () => { await restartSystem(); setShowRestartModal(false); fetch(); }}>
+            <Button onClick={async () => {
+              await restartSystem();
+              await waitForService(8000);
+              await fetch();
+              setShowRestartModal(false);
+              if (pendingProjectName) {
+                navigate(`/projects/${pendingProjectName}`);
+                setPendingProjectName('');
+              }
+            }}>
               {t('setup.restartNow', 'Restart now')}
             </Button>
           </div>

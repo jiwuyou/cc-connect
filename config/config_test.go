@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -531,6 +532,198 @@ func TestSaveAgentModel(t *testing.T) {
 	}
 }
 
+func TestAddWebProject_DerivesWorkDirFromDefaultBasePath(t *testing.T) {
+	basePath := filepath.Join(t.TempDir(), "workspaces")
+	configPath := writeConfigFixture(t, `
+	[bridge]
+	enabled = true
+
+	[management]
+	default_project_base_path = "`+basePath+`"
+
+	[[projects]]
+	name = "demo"
+
+	[projects.agent]
+	type = "claudecode"
+
+	[projects.agent.options]
+	mode = "default"
+	provider = "primary"
+
+	[[projects.agent.providers]]
+	name = "primary"
+	api_key = "sk-primary"
+	`)
+	patchConfigPath(t, configPath)
+
+	createdName, err := AddWebProject("", "mobile", "", "")
+	if err != nil {
+		t.Fatalf("AddWebProject() error: %v", err)
+	}
+	if !regexp.MustCompile(`^mobile-[0-9a-f]{8}$`).MatchString(createdName) {
+		t.Fatalf("createdName = %q, want mobile-<8hex>", createdName)
+	}
+
+	cfg := readConfigFixture(t, configPath)
+	if len(cfg.Projects) != 2 {
+		t.Fatalf("len(cfg.Projects) = %d, want 2", len(cfg.Projects))
+	}
+	proj := cfg.Projects[1]
+	if !regexp.MustCompile(`^mobile-[0-9a-f]{8}$`).MatchString(proj.Name) {
+		t.Fatalf("proj.Name = %q, want mobile-<8hex>", proj.Name)
+	}
+	wantWorkDir := filepath.Join(basePath, proj.Name)
+	if proj.DisplayName != "mobile" {
+		t.Fatalf("proj.DisplayName = %q, want mobile", proj.DisplayName)
+	}
+	if got := stringMapValue(proj.Agent.Options, "work_dir"); got != wantWorkDir {
+		t.Fatalf("work_dir = %q, want %q", got, wantWorkDir)
+	}
+	if proj.Agent.Type != "claudecode" {
+		t.Fatalf("agent type = %q, want claudecode", proj.Agent.Type)
+	}
+	if len(proj.Agent.Providers) != 1 || proj.Agent.Providers[0].Name != "primary" {
+		t.Fatalf("providers not cloned correctly: %+v", proj.Agent.Providers)
+	}
+	if info, err := os.Stat(wantWorkDir); err != nil {
+		t.Fatalf("expected auto-created work dir: %v", err)
+	} else if !info.IsDir() {
+		t.Fatalf("work dir %q is not a directory", wantWorkDir)
+	}
+}
+
+func TestAddWebProject_UsesExplicitWorkDir(t *testing.T) {
+	basePath := filepath.Join(t.TempDir(), "workspaces")
+	explicitWorkDir := filepath.Join(t.TempDir(), "custom", "workspace")
+	configPath := writeConfigFixture(t, `
+	[bridge]
+	enabled = true
+
+	[management]
+	default_project_base_path = "`+basePath+`"
+	`)
+	patchConfigPath(t, configPath)
+
+	createdName, err := AddWebProject("", "custom", explicitWorkDir, "cursor")
+	if err != nil {
+		t.Fatalf("AddWebProject() error: %v", err)
+	}
+	if !regexp.MustCompile(`^custom-[0-9a-f]{8}$`).MatchString(createdName) {
+		t.Fatalf("createdName = %q, want custom-<8hex>", createdName)
+	}
+
+	cfg := readConfigFixture(t, configPath)
+	if len(cfg.Projects) != 1 {
+		t.Fatalf("len(cfg.Projects) = %d, want 1", len(cfg.Projects))
+	}
+	proj := cfg.Projects[0]
+	if got := stringMapValue(proj.Agent.Options, "work_dir"); got != explicitWorkDir {
+		t.Fatalf("work_dir = %q, want %q", got, explicitWorkDir)
+	}
+	if proj.Agent.Type != "cursor" {
+		t.Fatalf("agent type = %q, want cursor", proj.Agent.Type)
+	}
+	if info, err := os.Stat(explicitWorkDir); err != nil {
+		t.Fatalf("expected explicit work dir to be created: %v", err)
+	} else if !info.IsDir() {
+		t.Fatalf("explicit work dir %q is not a directory", explicitWorkDir)
+	}
+}
+
+func TestAddWebProject_GeneratesSluggedNameFromDisplayName(t *testing.T) {
+	basePath := filepath.Join(t.TempDir(), "workspaces")
+	configPath := writeConfigFixture(t, `
+	[bridge]
+	enabled = true
+
+	[management]
+	default_project_base_path = "`+basePath+`"
+	`)
+	patchConfigPath(t, configPath)
+
+	createdName, err := AddWebProject("", "My Mobile App", "", "")
+	if err != nil {
+		t.Fatalf("AddWebProject() error: %v", err)
+	}
+	if !regexp.MustCompile(`^my-mobile-app-[0-9a-f]{8}$`).MatchString(createdName) {
+		t.Fatalf("createdName = %q, want my-mobile-app-<8hex>", createdName)
+	}
+}
+
+func TestAddWebProject_FallsBackWhenDisplayNameSlugIsEmpty(t *testing.T) {
+	basePath := filepath.Join(t.TempDir(), "workspaces")
+	configPath := writeConfigFixture(t, `
+	[bridge]
+	enabled = true
+
+	[management]
+	default_project_base_path = "`+basePath+`"
+	`)
+	patchConfigPath(t, configPath)
+
+	createdName, err := AddWebProject("", "中文 / ###", "", "")
+	if err != nil {
+		t.Fatalf("AddWebProject() error: %v", err)
+	}
+	if !regexp.MustCompile(`^project-[0-9a-f]{8}$`).MatchString(createdName) {
+		t.Fatalf("createdName = %q, want project-<8hex>", createdName)
+	}
+}
+
+func TestAddWebProject_GeneratesDifferentNamesForSameDisplayName(t *testing.T) {
+	basePath := filepath.Join(t.TempDir(), "workspaces")
+	configPath := writeConfigFixture(t, `
+	[bridge]
+	enabled = true
+
+	[management]
+	default_project_base_path = "`+basePath+`"
+	`)
+	patchConfigPath(t, configPath)
+
+	firstName, err := AddWebProject("", "mobile demo", "", "")
+	if err != nil {
+		t.Fatalf("first AddWebProject() error: %v", err)
+	}
+	secondName, err := AddWebProject("", "mobile demo", "", "")
+	if err != nil {
+		t.Fatalf("second AddWebProject() error: %v", err)
+	}
+	if firstName == secondName {
+		t.Fatalf("generated names should differ, both were %q", firstName)
+	}
+	pattern := regexp.MustCompile(`^mobile-demo-[0-9a-f]{8}$`)
+	if !pattern.MatchString(firstName) || !pattern.MatchString(secondName) {
+		t.Fatalf("generated names = %q, %q; want mobile-demo-<8hex>", firstName, secondName)
+	}
+}
+
+func TestAddWebProject_RequiresWorkDirWhenDefaultBasePathMissing(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+	[bridge]
+	enabled = true
+	`)
+	patchConfigPath(t, configPath)
+
+	_, err := AddWebProject("", "mobile", "", "")
+	assertErrContains(t, err, "work_dir is required when management.default_project_base_path is not configured")
+}
+
+func TestAddWebProject_RejectsRelativeDefaultBasePath(t *testing.T) {
+	configPath := writeConfigFixture(t, `
+	[bridge]
+	enabled = true
+
+	[management]
+	default_project_base_path = "relative/path"
+	`)
+	patchConfigPath(t, configPath)
+
+	_, err := AddWebProject("", "mobile", "", "")
+	assertErrContains(t, err, "management.default_project_base_path must be an absolute path")
+}
+
 func TestCommandConfig_AddAndRemove(t *testing.T) {
 	writeTestConfig(t, baseConfigTOML)
 
@@ -634,6 +827,7 @@ attachment_send = "off"
 
 [[projects]]
 name = "alpha"
+display_name = "Alpha"
 
 [projects.agent]
 type = "codex"
@@ -1259,6 +1453,7 @@ token = "test-token"
 const feishuConfigFixture = `
 [[projects]]
 name = "alpha"
+display_name = "Alpha"
 
 [projects.agent]
 type = "codex"
@@ -1892,7 +2087,9 @@ func TestSaveProjectSettings_ExtraFields(t *testing.T) {
 	show := true
 	wd := "/tmp/patched"
 	mode := "yolo"
+	displayName := "Alpha Alias"
 	err := SaveProjectSettings("alpha", ProjectSettingsUpdate{
+		DisplayName:          &displayName,
 		WorkDir:              &wd,
 		Mode:                 &mode,
 		ShowContextIndicator: &show,
@@ -1904,6 +2101,9 @@ func TestSaveProjectSettings_ExtraFields(t *testing.T) {
 
 	cfg := readConfigFixture(t, configPath)
 	proj := cfg.Projects[0]
+	if proj.DisplayName != displayName {
+		t.Fatalf("DisplayName = %q, want %q", proj.DisplayName, displayName)
+	}
 	if stringMapValue(proj.Agent.Options, "work_dir") != wd {
 		t.Fatalf("work_dir = %q, want %q", stringMapValue(proj.Agent.Options, "work_dir"), wd)
 	}
@@ -1928,6 +2128,9 @@ func TestGetProjectConfigDetails(t *testing.T) {
 	details := GetProjectConfigDetails("alpha")
 	if details == nil {
 		t.Fatal("GetProjectConfigDetails returned nil")
+	}
+	if details["display_name"] != "Alpha" {
+		t.Fatalf("display_name = %v", details["display_name"])
 	}
 	if details["work_dir"] != "/tmp/alpha" {
 		t.Fatalf("work_dir = %v", details["work_dir"])

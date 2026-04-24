@@ -46,6 +46,7 @@ export default function ProjectDetail() {
   const [loading, setLoading] = useState(true);
 
   // Settings form
+  const [displayName, setDisplayName] = useState('');
   const [language, setLanguage] = useState('');
   const [adminFrom, setAdminFrom] = useState('');
   const [disabledCmds, setDisabledCmds] = useState('');
@@ -125,6 +126,7 @@ export default function ProjectDetail() {
       ]);
       if (proj.status === 'fulfilled') {
         setProject(proj.value);
+        setDisplayName(proj.value.display_name || '');
         setLanguage(proj.value.settings?.language || '');
         setAdminFrom(proj.value.settings?.admin_from || '');
         setDisabledCmds(proj.value.settings?.disabled_commands?.join(', ') || '');
@@ -167,6 +169,7 @@ export default function ProjectDetail() {
     setSaving(true);
     try {
       await updateProject(name, {
+        display_name: displayName,
         language,
         admin_from: adminFrom,
         disabled_commands: disabledCmds.split(',').map(s => s.trim()).filter(Boolean),
@@ -214,7 +217,7 @@ export default function ProjectDetail() {
         <Link to="/projects" className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
           <ArrowLeft size={18} className="text-gray-400" />
         </Link>
-        <h2 className="text-xl font-bold text-gray-900 dark:text-white">{name}</h2>
+        <h2 className="text-xl font-bold text-gray-900 dark:text-white">{project?.display_name || name}</h2>
         {project && <Badge variant="info">{getAgentLabel(project.agent_type)}</Badge>}
       </div>
 
@@ -241,6 +244,15 @@ export default function ProjectDetail() {
       {tab === 'overview' && project && (
         <div className="space-y-4">
           <Card>
+            <div className="space-y-3 mb-4">
+              <Input
+                label={t('setup.projectName', 'Project name')}
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                placeholder={name}
+              />
+              <p className="text-xs text-gray-500 dark:text-gray-400">{name}</p>
+            </div>
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold text-gray-900 dark:text-white">{t('projects.platforms')}</h3>
               <Button size="sm" onClick={() => { setShowAddPlatform(true); setAddPlatType(''); }}>

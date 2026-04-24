@@ -17,7 +17,7 @@ export default function Dashboard() {
   const { t } = useTranslation();
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [recentSessions, setRecentSessions] = useState<(Session & { project: string })[]>([]);
+  const [recentSessions, setRecentSessions] = useState<(Session & { projectName: string; projectLabel: string })[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -29,15 +29,20 @@ export default function Dashboard() {
       setStatus(s);
       const projs = p.projects || [];
       setProjects(projs);
+      const projectLabels = new Map(projs.map(proj => [proj.name, proj.display_name || proj.name]));
 
       const sessResults = await Promise.allSettled(
         projs.map(proj => listSessions(proj.name).then(r => ({ project: proj.name, sessions: r.sessions || [] })))
       );
-      const allSessions: (Session & { project: string })[] = [];
+      const allSessions: (Session & { projectName: string; projectLabel: string })[] = [];
       for (const r of sessResults) {
         if (r.status === 'fulfilled') {
           for (const sess of r.value.sessions) {
-            allSessions.push({ ...sess, project: r.value.project });
+            allSessions.push({
+              ...sess,
+              projectName: r.value.project,
+              projectLabel: projectLabels.get(r.value.project) || r.value.project,
+            });
           }
         }
       }
@@ -103,7 +108,7 @@ export default function Dashboard() {
                     <Server size={14} className="text-accent" />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <p className="text-sm font-semibold text-gray-900 dark:text-white truncate">{p.name}</p>
+                    <p className="text-sm font-semibold text-gray-900 dark:text-white truncate">{p.display_name || p.name}</p>
                     <p className="text-xs text-gray-400">{getAgentLabel(p.agent_type)}</p>
                   </div>
                 </div>
@@ -138,8 +143,8 @@ export default function Dashboard() {
           <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3">
             {recentSessions.map((sess) => (
               <Link
-                key={`${sess.project}-${sess.id}`}
-                to={`/chat/${sess.project}`}
+                key={`${sess.projectName}-${sess.id}`}
+                to={`/chat/${sess.projectName}`}
                 className="block p-4 rounded-xl border border-gray-200/80 dark:border-white/[0.06] bg-white dark:bg-white/[0.02] hover:border-accent/40 hover:shadow-md hover:shadow-accent/5 transition-all"
               >
                 <div className="flex items-center gap-2.5 mb-3">
@@ -148,7 +153,7 @@ export default function Dashboard() {
                     {sess.name || sess.id}
                   </p>
                 </div>
-                <Badge className="text-xs mb-2">{sess.project}</Badge>
+                <Badge className="text-xs mb-2">{sess.projectLabel}</Badge>
                 {sess.last_message && (
                   <p className="text-xs text-gray-400 truncate mb-2">
                     {sess.last_message.content.slice(0, 60)}

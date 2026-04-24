@@ -2,6 +2,7 @@ import api from './client';
 
 export interface ProjectSummary {
   name: string;
+  display_name?: string;
   agent_type: string;
   platforms: string[];
   sessions_count: number;
@@ -15,6 +16,7 @@ export interface PlatformConfigInfo {
 
 export interface ProjectDetail {
   name: string;
+  display_name?: string;
   agent_type: string;
   work_dir?: string;
   agent_mode?: string;
@@ -38,6 +40,7 @@ export interface ProjectDetail {
 }
 
 export interface ProjectSettingsUpdate {
+  display_name?: string;
   language?: string;
   admin_from?: string;
   disabled_commands?: string[];
@@ -48,8 +51,8 @@ export interface ProjectSettingsUpdate {
 }
 
 export const listProjects = () => api.get<{ projects: ProjectSummary[] }>('/projects');
-export const createProject = (body: { name: string; work_dir?: string; agent_type?: string }) =>
-  api.post<{ message: string; restart_required: boolean }>('/projects', body);
+export const createProject = (body: { name?: string; display_name?: string; work_dir?: string; agent_type?: string }) =>
+  api.post<{ message: string; name?: string; display_name?: string; restart_required: boolean }>('/projects', body);
 export const getProject = (name: string) => api.get<ProjectDetail>(`/projects/${name}`);
 export const updateProject = (name: string, body: ProjectSettingsUpdate) => api.patch(`/projects/${name}`, body);
 

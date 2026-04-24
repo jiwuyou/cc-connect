@@ -18,6 +18,7 @@ import (
 // ProjectSettingsUpdate is passed to SetSaveProjectSettings to persist management API PATCH fields.
 // The implementation (typically in cmd/cc-connect) maps this to config.ProjectSettingsUpdate.
 type ProjectSettingsUpdate struct {
+	DisplayName          *string
 	Language             *string
 	AdminFrom            *string
 	DisabledCommands     []string
@@ -25,6 +26,24 @@ type ProjectSettingsUpdate struct {
 	Mode                 *string
 	ShowContextIndicator *bool
 	PlatformAllowFrom    map[string]string
+}
+
+func syncProjectAliasesForEngine(e *Engine) {
+	if e == nil || e.sessions == nil {
+		return
+	}
+	idToKey, _ := e.sessions.SessionKeyMap()
+	seen := make(map[string]struct{})
+	for _, sessionKey := range idToKey {
+		if sessionKey == "" {
+			continue
+		}
+		if _, ok := seen[sessionKey]; ok {
+			continue
+		}
+		seen[sessionKey] = struct{}{}
+		e.syncSessionAliases(e.sessions, sessionKey)
+	}
 }
 
 // ManagementServer provides an HTTP REST API for external management tools
@@ -46,7 +65,7 @@ type ManagementServer struct {
 	setupFeishuSave      func(req FeishuSetupSaveRequest) error
 	setupWeixinSave      func(req WeixinSetupSaveRequest) error
 	addPlatformToProject func(projectName, platType string, opts map[string]any, workDir, agentType string) error
-	createProject        func(projectName, workDir, agentType string) error
+	createProject        func(projectName, displayName, workDir, agentType string) (string, bool, error)
 	removeProject        func(projectName string) error
 	saveProjectSettings  func(projectName string, update ProjectSettingsUpdate) error
 	getProjectConfig     func(projectName string) map[string]any
@@ -94,7 +113,7 @@ func (m *ManagementServer) SetAddPlatformToProject(fn func(string, string, map[s
 	m.addPlatformToProject = fn
 }
 
-func (m *ManagementServer) SetCreateProject(fn func(string, string, string) error) {
+func (m *ManagementServer) SetCreateProject(fn func(string, string, string, string) (string, bool, error)) {
 	m.createProject = fn
 }
 
@@ -512,6 +531,7 @@ func (m *ManagementServer) handleProjects(w http.ResponseWriter, r *http.Request
 
 			projects = append(projects, map[string]any{
 				"name":              name,
+				"display_name":      e.DisplayName(),
 				"agent_type":        e.agent.Name(),
 				"platforms":         platNames,
 				"sessions_count":    sessCount,
@@ -525,25 +545,32 @@ func (m *ManagementServer) handleProjects(w http.ResponseWriter, r *http.Request
 			return
 		}
 		var body struct {
-			Name      string `json:"name"`
-			WorkDir   string `json:"work_dir"`
-			AgentType string `json:"agent_type"`
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+			WorkDir     string `json:"work_dir"`
+			AgentType   string `json:"agent_type"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
 		}
-		if strings.TrimSpace(body.Name) == "" {
-			mgmtError(w, http.StatusBadRequest, "name is required")
-			return
-		}
-		if err := m.createProject(body.Name, body.WorkDir, body.AgentType); err != nil {
+		createdProjectName, restartRequired, err := m.createProject(body.Name, body.DisplayName, body.WorkDir, body.AgentType)
+		if err != nil {
 			mgmtError(w, http.StatusInternalServerError, "save config: "+err.Error())
 			return
 		}
+		createdName := strings.TrimSpace(body.DisplayName)
+		if createdName == "" {
+			createdName = strings.TrimSpace(createdProjectName)
+			if createdName == "" {
+				createdName = "project"
+			}
+		}
 		mgmtJSON(w, http.StatusCreated, map[string]any{
-			"message":          fmt.Sprintf("project %q created", body.Name),
-			"restart_required": true,
+			"message":          fmt.Sprintf("project %q created", createdName),
+			"name":             strings.TrimSpace(createdProjectName),
+			"display_name":     strings.TrimSpace(body.DisplayName),
+			"restart_required": restartRequired,
 		})
 	default:
 		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
@@ -624,6 +651,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 
 		data := map[string]any{
 			"name":                name,
+			"display_name":        e.DisplayName(),
 			"agent_type":          e.agent.Name(),
 			"platforms":           platInfos,
 			"sessions_count":      sessCount,
@@ -676,6 +704,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 
 	if r.Method == http.MethodPatch {
 		var body struct {
+			DisplayName          *string           `json:"display_name"`
 			Language             *string           `json:"language"`
 			AdminFrom            *string           `json:"admin_from"`
 			DisabledCommands     []string          `json:"disabled_commands"`
@@ -689,6 +718,10 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 			return
 		}
 
+		if body.DisplayName != nil {
+			e.SetDisplayName(strings.TrimSpace(*body.DisplayName))
+			syncProjectAliasesForEngine(e)
+		}
 		if body.Language != nil {
 			switch *body.Language {
 			case "en":
@@ -725,6 +758,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 
 		if m.saveProjectSettings != nil {
 			patch := ProjectSettingsUpdate{
+				DisplayName:          body.DisplayName,
 				Language:             body.Language,
 				AdminFrom:            body.AdminFrom,
 				DisabledCommands:     body.DisabledCommands,
@@ -878,6 +912,8 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 			info := map[string]any{
 				"id":            s.ID,
 				"name":          s.Name,
+				"alias_mode":    s.AliasMode,
+				"alias_suffix":  s.AliasSuffix,
 				"session_key":   idToKey[s.ID],
 				"agent_type":    s.AgentType,
 				"active":        activeIDs[s.ID],
@@ -979,6 +1015,8 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		data := map[string]any{
 			"id":               s.ID,
 			"name":             s.Name,
+			"alias_mode":       s.AliasMode,
+			"alias_suffix":     s.AliasSuffix,
 			"session_key":      sessionKey,
 			"agent_session_id": s.AgentSessionID,
 			"agent_type":       s.AgentType,
@@ -1000,6 +1038,25 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 
 		mgmtJSON(w, http.StatusOK, data)
 
+	case http.MethodPatch:
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		name := strings.TrimSpace(body.Name)
+		if name == "" {
+			mgmtError(w, http.StatusBadRequest, "name is required")
+			return
+		}
+		if ok := e.sessions.SetSessionManualName(sessionID, name); !ok {
+			mgmtError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"id": sessionID, "name": name})
+
 	case http.MethodDelete:
 		if e.sessions.DeleteByID(sessionID) {
 			mgmtOK(w, "session deleted")
@@ -1008,7 +1065,7 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		}
 
 	default:
-		mgmtError(w, http.StatusMethodNotAllowed, "GET or DELETE only")
+		mgmtError(w, http.StatusMethodNotAllowed, "GET, PATCH or DELETE only")
 	}
 }
 

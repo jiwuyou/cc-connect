@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,12 +15,20 @@ import (
 // to use --continue (resume most recent session) instead of a specific session ID.
 const ContinueSession = "__continue__"
 
+const (
+	SessionAliasModeProjectSync   = "project_sync"
+	SessionAliasModeProjectSuffix = "project_suffix"
+	SessionAliasModeManual        = "manual"
+)
+
 // Session tracks one conversation between a user and the agent.
 type Session struct {
 	ID             string         `json:"id"`
 	Name           string         `json:"name"`
 	AgentSessionID string         `json:"agent_session_id"`
 	AgentType      string         `json:"agent_type,omitempty"`
+	AliasMode      string         `json:"alias_mode,omitempty"`
+	AliasSuffix    string         `json:"alias_suffix,omitempty"`
 	History        []HistoryEntry `json:"history"`
 	CreatedAt      time.Time      `json:"created_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`
@@ -75,6 +84,9 @@ func (s *Session) SetAgentInfo(agentSessionID, agentType, name string) {
 	s.AgentSessionID = agentSessionID
 	s.AgentType = agentType
 	s.Name = name
+	if strings.TrimSpace(name) != "" {
+		s.AliasMode = SessionAliasModeManual
+	}
 }
 
 // GetAgentSessionID atomically reads the agent session ID.
@@ -95,6 +107,50 @@ func (s *Session) GetUpdatedAt() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.UpdatedAt
+}
+
+func (s *Session) SetDisplayName(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if s.Name == name {
+		return
+	}
+	s.Name = name
+	s.UpdatedAt = time.Now()
+}
+
+func (s *Session) SetAlias(aliasMode, aliasSuffix, name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	aliasMode = strings.TrimSpace(aliasMode)
+	aliasSuffix = strings.TrimSpace(aliasSuffix)
+	name = strings.TrimSpace(name)
+	if s.AliasMode == aliasMode && s.AliasSuffix == aliasSuffix && s.Name == name {
+		return
+	}
+	s.AliasMode = aliasMode
+	s.AliasSuffix = aliasSuffix
+	s.Name = name
+	s.UpdatedAt = time.Now()
+}
+
+func (s *Session) SetManualName(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if s.AliasMode == SessionAliasModeManual && s.Name == name {
+		return
+	}
+	s.AliasMode = SessionAliasModeManual
+	s.Name = name
+	s.UpdatedAt = time.Now()
+}
+
+func (s *Session) AliasInfo() (aliasMode, aliasSuffix string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AliasMode, s.AliasSuffix
 }
 
 // SetAgentSessionID atomically sets the agent session ID and agent type.
@@ -309,6 +365,42 @@ func (sm *SessionManager) SwitchToAgentSession(userKey, agentSID, agentName, sum
 	return s
 }
 
+func (sm *SessionManager) SetSessionDisplayName(sessionID, name string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	s := sm.sessions[sessionID]
+	if s == nil {
+		return false
+	}
+	s.SetDisplayName(name)
+	sm.saveLocked()
+	return true
+}
+
+func (sm *SessionManager) SetSessionManualName(sessionID, name string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	s := sm.sessions[sessionID]
+	if s == nil {
+		return false
+	}
+	s.SetManualName(name)
+	sm.saveLocked()
+	return true
+}
+
+func (sm *SessionManager) SetSessionAlias(sessionID, aliasMode, aliasSuffix, name string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	s := sm.sessions[sessionID]
+	if s == nil {
+		return false
+	}
+	s.SetAlias(aliasMode, aliasSuffix, name)
+	sm.saveLocked()
+	return true
+}
+
 func (sm *SessionManager) ListSessions(userKey string) []*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -333,10 +425,24 @@ func (sm *SessionManager) ActiveSessionID(userKey string) string {
 func (sm *SessionManager) SetSessionName(agentSessionID, name string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	name = strings.TrimSpace(name)
 	if name == "" {
 		delete(sm.sessionNames, agentSessionID)
 	} else {
 		sm.sessionNames[agentSessionID] = name
+	}
+	for _, s := range sm.sessions {
+		s.mu.Lock()
+		if s.AgentSessionID == agentSessionID {
+			s.Name = name
+			if name == "" {
+				s.AliasMode = ""
+			} else {
+				s.AliasMode = SessionAliasModeManual
+			}
+			s.UpdatedAt = time.Now()
+		}
+		s.mu.Unlock()
 	}
 	sm.saveLocked()
 }
@@ -345,7 +451,19 @@ func (sm *SessionManager) SetSessionName(agentSessionID, name string) {
 func (sm *SessionManager) GetSessionName(agentSessionID string) string {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	return sm.sessionNames[agentSessionID]
+	if name := strings.TrimSpace(sm.sessionNames[agentSessionID]); name != "" {
+		return name
+	}
+	for _, s := range sm.sessions {
+		s.mu.Lock()
+		matched := s.AgentSessionID == agentSessionID
+		name := strings.TrimSpace(s.Name)
+		s.mu.Unlock()
+		if matched {
+			return name
+		}
+	}
+	return ""
 }
 
 // UpdateUserMeta updates the human-readable metadata for a session key.
@@ -515,6 +633,8 @@ func (sm *SessionManager) saveLocked() {
 			Name:           s.Name,
 			AgentSessionID: agentSID,
 			AgentType:      s.AgentType,
+			AliasMode:      s.AliasMode,
+			AliasSuffix:    s.AliasSuffix,
 			History:        append([]HistoryEntry(nil), s.History...),
 			CreatedAt:      s.CreatedAt,
 			UpdatedAt:      s.UpdatedAt,

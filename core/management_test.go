@@ -285,6 +285,91 @@ func TestMgmt_ProjectDetail(t *testing.T) {
 	}
 }
 
+func TestMgmt_ProjectCreateAllowsEmptyWorkDir(t *testing.T) {
+	mgmt, ts, _ := testManagementServer(t, "tok")
+
+	var gotName, gotDisplayName, gotWorkDir, gotAgentType string
+	mgmt.createProject = func(name, displayName, workDir, agentType string) (string, bool, error) {
+		gotName = name
+		gotDisplayName = displayName
+		gotWorkDir = workDir
+		gotAgentType = agentType
+		return "p-ab12cd34", false, nil
+	}
+
+	r := mgmtPost(t, ts.URL+"/api/v1/projects", "tok", map[string]string{
+		"display_name": "mobile",
+		"agent_type":   "codex",
+	})
+	if !r.OK {
+		t.Fatalf("project create failed: %s", r.Error)
+	}
+	if gotName != "" {
+		t.Fatalf("name = %q, want empty", gotName)
+	}
+	if gotDisplayName != "mobile" {
+		t.Fatalf("displayName = %q, want mobile", gotDisplayName)
+	}
+	if gotWorkDir != "" {
+		t.Fatalf("workDir = %q, want empty", gotWorkDir)
+	}
+	if gotAgentType != "codex" {
+		t.Fatalf("agentType = %q, want codex", gotAgentType)
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal project create response: %v", err)
+	}
+	if data["name"] != "p-ab12cd34" {
+		t.Fatalf("response name = %v, want p-ab12cd34", data["name"])
+	}
+	if data["display_name"] != "mobile" {
+		t.Fatalf("response display_name = %v, want mobile", data["display_name"])
+	}
+}
+
+func TestMgmt_ProjectCreatePropagatesRestartRequired(t *testing.T) {
+	mgmt, ts, _ := testManagementServer(t, "tok")
+	mgmt.createProject = func(name, displayName, workDir, agentType string) (string, bool, error) {
+		return "p-hotload", false, nil
+	}
+
+	r := mgmtPost(t, ts.URL+"/api/v1/projects", "tok", map[string]string{
+		"display_name": "hotload",
+		"agent_type":   "claudecode",
+	})
+	if !r.OK {
+		t.Fatalf("project create failed: %s", r.Error)
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal project create response: %v", err)
+	}
+	if data["restart_required"] != false {
+		t.Fatalf("restart_required = %v, want false", data["restart_required"])
+	}
+}
+
+func TestMgmt_ProjectDetailIncludesDisplayName(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	e.SetDisplayName("Alias")
+	mgmt.RegisterEngine("test-project", e)
+
+	r := mgmtGet(t, ts.URL+"/api/v1/projects/test-project", "tok")
+	if !r.OK {
+		t.Fatalf("detail failed: %s", r.Error)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal detail data: %v", err)
+	}
+	if data["display_name"] != "Alias" {
+		t.Fatalf("display_name = %v, want Alias", data["display_name"])
+	}
+}
+
 func TestMgmt_ProjectPatch(t *testing.T) {
 	_, ts, _ := testManagementServer(t, "tok")
 
@@ -353,6 +438,56 @@ func TestMgmt_SessionDelete(t *testing.T) {
 	r = mgmtGet(t, ts.URL+"/api/v1/projects/test-project/sessions/"+sid, "tok")
 	if r.OK {
 		t.Fatal("expected 404 after deletion")
+	}
+}
+
+func TestMgmt_SessionPatchRename(t *testing.T) {
+	_, ts, e := testManagementServer(t, "tok")
+	s := e.sessions.GetOrCreateActive("user1")
+
+	r := mgmtPatch(t, ts.URL+"/api/v1/projects/test-project/sessions/"+s.ID, "tok", map[string]string{
+		"name": "手动会话",
+	})
+	if !r.OK {
+		t.Fatalf("patch failed: %s", r.Error)
+	}
+	if got := s.GetName(); got != "手动会话" {
+		t.Fatalf("GetName = %q", got)
+	}
+	mode, _ := s.AliasInfo()
+	if mode != SessionAliasModeManual {
+		t.Fatalf("AliasMode = %q", mode)
+	}
+}
+
+func TestMgmt_ProjectPatchSyncsSessionAliases(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	e.SetDisplayName("旧项目")
+	mgmt.RegisterEngine("test-project", e)
+	key := "user1"
+	first := e.sessions.GetOrCreateActive(key)
+	e.ensureSessionAlias(first, e.sessions, key, "主会话")
+	second := e.sessions.NewSession(key, "")
+	e.ensureSessionAlias(second, e.sessions, key, "第二个会话")
+	third := e.sessions.NewSession(key, "")
+	e.ensureSessionAlias(third, e.sessions, key, "第三个会话")
+	third.SetManualName("固定名称")
+	e.sessions.Save()
+
+	r := mgmtPatch(t, ts.URL+"/api/v1/projects/test-project", "tok", map[string]string{
+		"display_name": "新项目",
+	})
+	if !r.OK {
+		t.Fatalf("project patch failed: %s", r.Error)
+	}
+	if got := first.GetName(); got != "新项目 · 主会话" {
+		t.Fatalf("first GetName = %q", got)
+	}
+	if got := second.GetName(); got != "新项目 · 第二个会话" {
+		t.Fatalf("second GetName = %q", got)
+	}
+	if got := third.GetName(); got != "固定名称" {
+		t.Fatalf("third GetName = %q", got)
 	}
 }
 
