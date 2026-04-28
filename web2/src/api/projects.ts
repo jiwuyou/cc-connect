@@ -14,12 +14,21 @@ export interface PlatformConfigInfo {
   allow_from?: string;
 }
 
+export interface PermissionModeInfo {
+  key: string;
+  name?: string;
+  nameZh?: string;
+  desc?: string;
+  descZh?: string;
+}
+
 export interface ProjectDetail {
   name: string;
   display_name?: string;
   agent_type: string;
   work_dir?: string;
   agent_mode?: string;
+  permission_modes?: PermissionModeInfo[];
   show_context_indicator?: boolean;
   reply_footer?: boolean;
   provider_refs?: string[];

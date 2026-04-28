@@ -86,12 +86,14 @@ func normalizeBackend(raw string) string {
 
 func normalizeMode(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "auto-edit", "autoedit", "auto_edit", "edit":
+	case "auto-edit", "autoedit", "auto_edit", "edit", "acceptedits", "accept-edits", "accept_edits":
 		return "auto-edit"
 	case "full-auto", "fullauto", "full_auto", "auto":
 		return "full-auto"
-	case "yolo", "bypass", "dangerously-bypass":
+	case "yolo", "bypass", "bypasspermissions", "bypass-permissions", "bypass_permissions", "dangerously-bypass":
 		return "yolo"
+	case "", "suggest", "default", "plan", "dontask", "dont-ask", "dont_ask", "ask":
+		return "suggest"
 	default:
 		return "suggest"
 	}

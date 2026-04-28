@@ -6,7 +6,7 @@ import {
   Trash2, Plus, Clock, ExternalLink, Link2,
 } from 'lucide-react';
 import { Card, Badge, Button, Input, Modal, EmptyState } from '@/components/ui';
-import { getProject, updateProject, deleteProject, deleteProjectPlatform, type ProjectDetail as ProjectDetailType } from '@/api/projects';
+import { getProject, updateProject, deleteProject, deleteProjectPlatform, type PermissionModeInfo, type ProjectDetail as ProjectDetailType } from '@/api/projects';
 import { listProviders, addProvider, removeProvider, activateProvider, listModels, setModel, type Provider, listGlobalProviders, type GlobalProvider, saveProviderRefs } from '@/api/providers';
 import { getHeartbeat, pauseHeartbeat, resumeHeartbeat, triggerHeartbeat, setHeartbeatInterval, type HeartbeatStatus } from '@/api/heartbeat';
 import { restartSystem } from '@/api/status';
@@ -34,7 +34,7 @@ const isQRPlatform = (type: string) => type === 'feishu' || type === 'lark' || t
 type Tab = 'overview' | 'providers' | 'heartbeat' | 'settings';
 
 export default function ProjectDetail() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { name } = useParams<{ name: string }>();
   const [tab, setTab] = useState<Tab>('overview');
   const [project, setProject] = useState<ProjectDetailType | null>(null);
@@ -83,6 +83,19 @@ export default function ProjectDetail() {
   const navigate = useNavigate();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
+
+  const basePermissionModes = project?.permission_modes?.length ? project.permission_modes : [];
+  const permissionModes = basePermissionModes.length > 0
+    ? basePermissionModes
+    : [{ key: agentMode || 'default', name: agentMode || 'default' }];
+  const permissionModeOptions = agentMode && !permissionModes.some((mode) => mode.key === agentMode)
+    ? [...permissionModes, { key: agentMode, name: agentMode }]
+    : permissionModes;
+  const formatPermissionMode = (mode: PermissionModeInfo) => {
+    const zh = i18n.language?.toLowerCase().startsWith('zh');
+    const label = zh ? mode.nameZh || mode.name : mode.name || mode.nameZh;
+    return label && label !== mode.key ? `${mode.key} (${label})` : mode.key;
+  };
 
   const handleDeleteProject = async () => {
     if (!name) return;
@@ -161,7 +174,7 @@ export default function ProjectDetail() {
         setAdminFrom(proj.value.settings?.admin_from || '');
         setDisabledCmds(proj.value.settings?.disabled_commands?.join(', ') || '');
         setWorkDir(proj.value.work_dir || '');
-        setAgentMode(proj.value.agent_mode || 'default');
+        setAgentMode(proj.value.agent_mode || proj.value.permission_modes?.[0]?.key || 'default');
         setShowCtxIndicator(proj.value.show_context_indicator !== false);
         setReplyFooter(proj.value.reply_footer !== false);
         setProviderRefs(proj.value.provider_refs || []);
@@ -588,11 +601,9 @@ export default function ProjectDetail() {
                 onChange={(e) => setAgentMode(e.target.value)}
                 className="w-full px-3 py-2 text-sm rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50"
               >
-                <option value="default">default</option>
-                <option value="acceptEdits">acceptEdits (edit)</option>
-                <option value="plan">plan</option>
-                <option value="bypassPermissions">bypassPermissions (yolo)</option>
-                <option value="dontAsk">dontAsk</option>
+                {permissionModeOptions.map((mode) => (
+                  <option key={mode.key} value={mode.key}>{formatPermissionMode(mode)}</option>
+                ))}
               </select>
             </div>
           </div>
