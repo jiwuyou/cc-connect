@@ -54,6 +54,7 @@ ws://<host>:<port>/bridge/ws
 ```toml
 [bridge]
 enabled = true
+host = "127.0.0.1"       # 可选，留空/默认监听所有地址
 port = 9810
 path = "/bridge/ws"       # 可选，默认 "/bridge/ws"
 token = "your-secret"     # 认证密钥，必填

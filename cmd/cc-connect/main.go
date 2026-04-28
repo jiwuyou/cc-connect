@@ -262,6 +262,7 @@ func main() {
 			path = "/bridge/ws"
 		}
 		bridgeSrv = core.NewBridgeServer(port, cfg.Bridge.Token, path, cfg.Bridge.CORSOrigins)
+		bridgeSrv.SetHost(cfg.Bridge.Host)
 		for _, runtime := range projectRuntimes {
 			bp := bridgeSrv.NewPlatform(runtime.project.Name)
 			bridgeSrv.RegisterEngine(runtime.project.Name, runtime.engine, bp)
@@ -297,6 +298,7 @@ func main() {
 			port = 9820
 		}
 		mgmtSrv = core.NewManagementServer(port, cfg.Management.Token, cfg.Management.CORSOrigins)
+		mgmtSrv.SetHost(cfg.Management.Host)
 		for _, runtime := range projectRuntimes {
 			mgmtSrv.RegisterEngine(runtime.project.Name, runtime.engine)
 		}

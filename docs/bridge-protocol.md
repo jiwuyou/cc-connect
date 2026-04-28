@@ -54,6 +54,7 @@ The port and path are configured in `config.toml`:
 ```toml
 [bridge]
 enabled = true
+host = "127.0.0.1"       # optional, empty/default listens on all interfaces
 port = 9810
 path = "/bridge/ws"       # optional, default "/bridge/ws"
 token = "your-secret"     # required for authentication

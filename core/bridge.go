@@ -25,6 +25,7 @@ import (
 // lightweight BridgePlatform handle that delegates to this server.
 type BridgeServer struct {
 	port        int
+	host        string
 	token       string
 	path        string
 	corsOrigins []string
@@ -178,6 +179,10 @@ func NewBridgeServer(port int, token, path string, corsOrigins []string) *Bridge
 	}
 }
 
+func (bs *BridgeServer) SetHost(host string) {
+	bs.host = strings.TrimSpace(host)
+}
+
 // NewPlatform creates a BridgePlatform for a specific project engine.
 func (bs *BridgeServer) NewPlatform(projectName string) *BridgePlatform {
 	return &BridgePlatform{server: bs, project: projectName}
@@ -203,7 +208,7 @@ func (bs *BridgeServer) Start() {
 	mux.HandleFunc("/bridge/sessions", bs.corsHTTP(bs.authHTTP(bs.handleSessions)))
 	mux.HandleFunc("/bridge/sessions/", bs.corsHTTP(bs.authHTTP(bs.handleSessionRoutes)))
 
-	addr := fmt.Sprintf(":%d", bs.port)
+	addr := tcpListenAddr(bs.host, bs.port)
 	bs.server = &http.Server{Addr: addr, Handler: mux}
 
 	go func() {

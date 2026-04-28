@@ -56,6 +56,7 @@ Add the following to `config.toml`:
 ```toml
 [management]
 enabled = true
+host = "127.0.0.1"
 port = 9820
 token = "mgmt-secret"
 ```
@@ -63,6 +64,7 @@ token = "mgmt-secret"
 | Field    | Type    | Default   | Description                                      |
 |----------|---------|-----------|--------------------------------------------------|
 | `enabled`| boolean | `false`   | Enable the Management API server                 |
+| `host`   | string  | `""`      | Listen host; empty means all interfaces          |
 | `port`   | integer | `9820`    | TCP port to listen on                            |
 | `token`  | string  | (required)| Shared secret for authentication                 |
 

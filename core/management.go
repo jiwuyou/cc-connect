@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -53,6 +54,7 @@ func syncProjectAliasesForEngine(e *Engine) {
 // (web dashboards, TUI clients, GUI desktop apps, Mac tray apps, etc.).
 type ManagementServer struct {
 	port        int
+	host        string
 	token       string
 	corsOrigins []string
 	server      *http.Server
@@ -107,6 +109,7 @@ func (m *ManagementServer) RegisterEngine(name string, e *Engine) {
 func (m *ManagementServer) SetCronScheduler(cs *CronScheduler)           { m.cronScheduler = cs }
 func (m *ManagementServer) SetHeartbeatScheduler(hs *HeartbeatScheduler) { m.heartbeatScheduler = hs }
 func (m *ManagementServer) SetBridgeServer(bs *BridgeServer)             { m.bridgeServer = bs }
+func (m *ManagementServer) SetHost(host string)                          { m.host = strings.TrimSpace(host) }
 func (m *ManagementServer) SetFrontendAppRegistry(registry *FrontendAppRegistry) {
 	m.frontendRegistry = registry
 }
@@ -192,8 +195,9 @@ func (m *ManagementServer) Start() {
 	mux := http.NewServeMux()
 	handler := m.buildHandler(mux)
 
+	addr := tcpListenAddr(m.host, m.port)
 	m.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", m.port),
+		Addr:    addr,
 		Handler: handler,
 	}
 	go func() {
@@ -201,7 +205,7 @@ func (m *ManagementServer) Start() {
 			slog.Error("management api server error", "error", err)
 		}
 	}()
-	slog.Info("management api started", "port", m.port)
+	slog.Info("management api started", "addr", addr)
 }
 
 func (m *ManagementServer) buildHandler(mux *http.ServeMux) http.Handler {
@@ -244,6 +248,14 @@ func (m *ManagementServer) buildHandler(mux *http.ServeMux) http.Handler {
 
 	// Static file serving for cc-connect-web (SPA)
 	return m.withStaticFallback(mux)
+}
+
+func tcpListenAddr(host string, port int) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Sprintf(":%d", port)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func (m *ManagementServer) Stop() {

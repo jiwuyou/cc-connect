@@ -56,6 +56,7 @@ cc-connect 管理 API 是基于 HTTP 的 REST API，供外部应用（Web 控制
 ```toml
 [management]
 enabled = true
+host = "127.0.0.1"
 port = 9820
 token = "mgmt-secret"
 ```
@@ -63,6 +64,7 @@ token = "mgmt-secret"
 | 字段       | 类型    | 默认值   | 说明                                      |
 |------------|---------|----------|-------------------------------------------|
 | `enabled`  | boolean | `false`  | 是否启用管理 API 服务                     |
+| `host`     | string  | `""`     | 监听地址；留空表示监听所有地址            |
 | `port`     | integer | `9820`   | 监听 TCP 端口                             |
 | `token`    | string  | (必填)   | 认证用共享密钥                            |
 

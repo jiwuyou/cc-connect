@@ -69,6 +69,27 @@ func testManagementServer(t *testing.T, token string) (*ManagementServer, *httpt
 	return mgmt, ts, e
 }
 
+func TestTCPListenAddr(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		port int
+		want string
+	}{
+		{name: "all interfaces", host: "", port: 9820, want: ":9820"},
+		{name: "ipv4 loopback", host: "127.0.0.1", port: 9820, want: "127.0.0.1:9820"},
+		{name: "trim host", host: "  localhost  ", port: 9810, want: "localhost:9810"},
+		{name: "ipv6 loopback", host: "::1", port: 9820, want: "[::1]:9820"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tcpListenAddr(tt.host, tt.port); got != tt.want {
+				t.Fatalf("tcpListenAddr(%q, %d) = %q, want %q", tt.host, tt.port, got, tt.want)
+			}
+		})
+	}
+}
+
 type mgmtResponse struct {
 	OK    bool            `json:"ok"`
 	Data  json.RawMessage `json:"data,omitempty"`
