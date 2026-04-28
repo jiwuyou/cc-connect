@@ -113,6 +113,31 @@ func (a *resultAgent) StartSession(_ context.Context, _ string) (AgentSession, e
 func (a *resultAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
 func (a *resultAgent) Stop() error                                                { return nil }
 
+type startIDRecordingAgent struct {
+	mu       sync.Mutex
+	startIDs []string
+}
+
+func (a *startIDRecordingAgent) Name() string { return "stub" }
+func (a *startIDRecordingAgent) StartSession(_ context.Context, id string) (AgentSession, error) {
+	a.mu.Lock()
+	a.startIDs = append(a.startIDs, id)
+	idx := len(a.startIDs)
+	a.mu.Unlock()
+	return newResultAgentSession(fmt.Sprintf("reply-%d", idx)), nil
+}
+func (a *startIDRecordingAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *startIDRecordingAgent) Stop() error { return nil }
+func (a *startIDRecordingAgent) StartIDs() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, len(a.startIDs))
+	copy(out, a.startIDs)
+	return out
+}
+
 type sessionEnvRecordingAgent struct {
 	stubAgent
 	session AgentSession
@@ -2301,6 +2326,9 @@ func TestHandleMessage_MultiWorkspacePreservesCCSessionKey(t *testing.T) {
 			if strings.Contains(got, normalizedWsDir) {
 				t.Fatalf("CC_SESSION_KEY leaked workspace path: %q", got)
 			}
+			if sid := wsAgent.EnvValue("CC_SESSION_ID"); sid == "" {
+				t.Fatal("CC_SESSION_ID was not injected")
+			}
 			return
 		}
 
@@ -2310,6 +2338,420 @@ func TestHandleMessage_MultiWorkspacePreservesCCSessionKey(t *testing.T) {
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+}
+
+func TestHandleMessage_WithSessionIDRoutesWithinSameSessionKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &startIDRecordingAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "webnew:web-admin:project"
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+
+	e.handleMessage(p, &Message{
+		SessionKey: key,
+		SessionID:  first.ID,
+		Platform:   "test",
+		UserID:     "u1",
+		UserName:   "user",
+		Content:    "message for first",
+		ReplyCtx:   "ctx-first",
+	})
+
+	deadline := time.After(2 * time.Second)
+	for len(first.GetHistory(0)) < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for first session, history=%#v", first.GetHistory(0))
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if got := len(second.GetHistory(0)); got != 0 {
+		t.Fatalf("second session history len after first message = %d, want 0", got)
+	}
+	if active := e.sessions.GetOrCreateActive(key); active.ID != second.ID {
+		t.Fatalf("targeted message changed active session to %s, want %s", active.ID, second.ID)
+	}
+
+	e.handleMessage(p, &Message{
+		SessionKey: key,
+		SessionID:  second.ID,
+		Platform:   "test",
+		UserID:     "u1",
+		UserName:   "user",
+		Content:    "message for second",
+		ReplyCtx:   "ctx-second",
+	})
+
+	deadline = time.After(2 * time.Second)
+	for len(second.GetHistory(0)) < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for second session, history=%#v", second.GetHistory(0))
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	startIDs := agent.StartIDs()
+	if len(startIDs) != 2 {
+		t.Fatalf("StartSession calls = %v, want two calls", startIDs)
+	}
+	if startIDs[0] != "agent-first" || startIDs[1] != "agent-second" {
+		t.Fatalf("StartSession IDs = %v, want [agent-first agent-second]", startIDs)
+	}
+
+	e.interactiveMu.Lock()
+	_, firstState := e.interactiveStates[interactiveKeyWithSessionID(key, first.ID)]
+	_, secondState := e.interactiveStates[interactiveKeyWithSessionID(key, second.ID)]
+	_, legacyState := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if !firstState || !secondState {
+		t.Fatalf("expected separate interactive states for both sessions, got first=%v second=%v", firstState, secondState)
+	}
+	if legacyState {
+		t.Fatalf("unexpected legacy interactive state for targeted session messages")
+	}
+}
+
+func TestHandleMessage_WithSessionIDRejectsCrossKeySession(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &startIDRecordingAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	foreign := e.sessions.NewSession("webnew:web-admin:project-a", "foreign")
+	local := e.sessions.GetOrCreateActive("webnew:web-admin:project-b")
+
+	e.handleMessage(p, &Message{
+		SessionKey: "webnew:web-admin:project-b",
+		SessionID:  foreign.ID,
+		Platform:   "test",
+		UserID:     "u1",
+		UserName:   "user",
+		Content:    "should not route",
+		ReplyCtx:   "ctx",
+	})
+
+	if len(agent.StartIDs()) != 0 {
+		t.Fatalf("agent was started for cross-key session id: %v", agent.StartIDs())
+	}
+	if history := local.GetHistory(0); len(history) != 0 {
+		t.Fatalf("local history = %#v, want empty", history)
+	}
+	if sent := p.getSent(); len(sent) == 0 {
+		t.Fatal("expected an error reply for cross-key session id")
+	}
+}
+
+func TestSendToSessionWithSessionIDTargetsSpecificInteractiveState(t *testing.T) {
+	key := "webnew:web-admin:project"
+	p1 := &stubPlatformEngine{n: "webnew"}
+	p2 := &stubPlatformEngine{n: "webnew"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p1, p2}, "", LangEnglish)
+
+	first := e.sessions.NewSession(key, "first")
+	second := e.sessions.NewSession(key, "second")
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[interactiveKeyWithSessionID(key, first.ID)] = &interactiveState{platform: p1, replyCtx: "ctx-first"}
+	e.interactiveStates[interactiveKeyWithSessionID(key, second.ID)] = &interactiveState{platform: p2, replyCtx: "ctx-second"}
+	e.interactiveMu.Unlock()
+
+	if err := e.SendToSessionWithSessionID(key, second.ID, "targeted"); err != nil {
+		t.Fatalf("SendToSessionWithSessionID returned error: %v", err)
+	}
+	if got := p1.getSent(); len(got) != 0 {
+		t.Fatalf("first platform sent = %v, want empty", got)
+	}
+	if got := p2.getSent(); len(got) != 1 || got[0] != "targeted" {
+		t.Fatalf("second platform sent = %v, want targeted", got)
+	}
+	if err := e.SendToSessionWithSessionID(key, "missing", "lost"); err == nil {
+		t.Fatal("expected missing targeted session runtime state to fail")
+	}
+}
+
+func TestCommandsWithSessionIDUseTargetSession(t *testing.T) {
+	key := "webnew:web-admin:project"
+	p := &stubPlatformEngine{n: "plain"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	first.AddHistory("user", "first-user")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+	second.AddHistory("user", "second-user")
+
+	msg := &Message{SessionKey: key, SessionID: first.ID, ReplyCtx: "ctx"}
+	e.cmdCurrent(p, msg)
+	e.cmdHistory(p, msg, []string{"5"})
+
+	sent := strings.Join(p.getSent(), "\n")
+	if !strings.Contains(sent, "agent-first") {
+		t.Fatalf("command replies = %q, want agent-first", sent)
+	}
+	if strings.Contains(sent, "agent-second") || strings.Contains(sent, "second-user") {
+		t.Fatalf("command replies = %q, should not include second session", sent)
+	}
+	if !strings.Contains(sent, "first-user") {
+		t.Fatalf("command replies = %q, want first history", sent)
+	}
+}
+
+func TestCmdModelWithSessionIDClearsOnlyTargetSession(t *testing.T) {
+	key := "webnew:web-admin:project"
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{model: "gpt-4.1-mini"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	first.AddHistory("user", "first-user")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+	second.AddHistory("user", "second-user")
+
+	e.cmdModel(p, &Message{SessionKey: key, SessionID: first.ID, ReplyCtx: "ctx"}, []string{"switch", "gpt"})
+
+	if got := first.GetAgentSessionID(); got != "" {
+		t.Fatalf("first AgentSessionID = %q, want cleared", got)
+	}
+	if got := len(first.GetHistory(0)); got != 0 {
+		t.Fatalf("first history len = %d, want cleared", got)
+	}
+	if got := second.GetAgentSessionID(); got != "agent-second" {
+		t.Fatalf("second AgentSessionID = %q, want unchanged", got)
+	}
+	if got := len(second.GetHistory(0)); got != 1 {
+		t.Fatalf("second history len = %d, want unchanged", got)
+	}
+}
+
+func TestCmdReasoningWithSessionIDClearsOnlyTargetSession(t *testing.T) {
+	key := "webnew:web-admin:project"
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	first.AddHistory("user", "first-user")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+	second.AddHistory("user", "second-user")
+
+	e.cmdReasoning(p, &Message{SessionKey: key, SessionID: first.ID, ReplyCtx: "ctx"}, []string{"3"})
+
+	if got := first.GetAgentSessionID(); got != "" {
+		t.Fatalf("first AgentSessionID = %q, want cleared", got)
+	}
+	if got := len(first.GetHistory(0)); got != 0 {
+		t.Fatalf("first history len = %d, want cleared", got)
+	}
+	if got := second.GetAgentSessionID(); got != "agent-second" {
+		t.Fatalf("second AgentSessionID = %q, want unchanged", got)
+	}
+	if got := len(second.GetHistory(0)); got != 1 {
+		t.Fatalf("second history len = %d, want unchanged", got)
+	}
+}
+
+func TestCmdModeWithSessionIDAppliesLiveModeOnlyTargetSession(t *testing.T) {
+	key := "webnew:web-admin:project"
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{mode: "default"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	first.AddHistory("user", "first-user")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+	second.AddHistory("user", "second-user")
+
+	baseLive := &stubLiveModeSession{}
+	firstLive := &stubLiveModeSession{}
+	secondLive := &stubLiveModeSession{}
+	baseKey := e.interactiveKeyForSessionKey(key)
+	e.interactiveMu.Lock()
+	e.interactiveStates[baseKey] = &interactiveState{agentSession: baseLive, platform: p, replyCtx: "ctx-base"}
+	e.interactiveStates[interactiveKeyWithSessionID(baseKey, first.ID)] = &interactiveState{agentSession: firstLive, platform: p, replyCtx: "ctx-first"}
+	e.interactiveStates[interactiveKeyWithSessionID(baseKey, second.ID)] = &interactiveState{agentSession: secondLive, platform: p, replyCtx: "ctx-second"}
+	e.interactiveMu.Unlock()
+
+	e.cmdMode(p, &Message{SessionKey: key, SessionID: first.ID, ReplyCtx: "ctx"}, []string{"yolo"})
+
+	if got := firstLive.modes; len(got) != 1 || got[0] != "yolo" {
+		t.Fatalf("first live modes = %v, want [yolo]", got)
+	}
+	if got := secondLive.modes; len(got) != 0 {
+		t.Fatalf("second live modes = %v, want unchanged", got)
+	}
+	if got := baseLive.modes; len(got) != 0 {
+		t.Fatalf("base live modes = %v, want unchanged", got)
+	}
+	if got := first.GetAgentSessionID(); got != "agent-first" {
+		t.Fatalf("first AgentSessionID = %q, want unchanged", got)
+	}
+	if got := second.GetAgentSessionID(); got != "agent-second" {
+		t.Fatalf("second AgentSessionID = %q, want unchanged", got)
+	}
+	if got := len(first.GetHistory(0)); got != 1 {
+		t.Fatalf("first history len = %d, want unchanged", got)
+	}
+	if got := len(second.GetHistory(0)); got != 1 {
+		t.Fatalf("second history len = %d, want unchanged", got)
+	}
+}
+
+func TestCmdDirWithSessionIDClearsOnlyTargetSession(t *testing.T) {
+	key := "webnew:web-admin:project"
+	p := &stubPlatformEngine{n: "plain"}
+	tempDir := t.TempDir()
+	nextDir := filepath.Join(tempDir, "next")
+	if err := os.Mkdir(nextDir, 0o755); err != nil {
+		t.Fatalf("mkdir next dir: %v", err)
+	}
+	agent := &stubWorkDirAgent{workDir: tempDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	first.AddHistory("user", "first-user")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+	second.AddHistory("user", "second-user")
+
+	e.cmdDir(p, &Message{SessionKey: key, SessionID: first.ID, ReplyCtx: "ctx"}, []string{"next"})
+
+	if agent.workDir != nextDir {
+		t.Fatalf("workDir = %q, want %q", agent.workDir, nextDir)
+	}
+	if got := first.GetAgentSessionID(); got != "" {
+		t.Fatalf("first AgentSessionID = %q, want cleared", got)
+	}
+	if got := len(first.GetHistory(0)); got != 0 {
+		t.Fatalf("first history len = %d, want cleared", got)
+	}
+	if got := second.GetAgentSessionID(); got != "agent-second" {
+		t.Fatalf("second AgentSessionID = %q, want unchanged", got)
+	}
+	if got := len(second.GetHistory(0)); got != 1 {
+		t.Fatalf("second history len = %d, want unchanged", got)
+	}
+}
+
+func TestHandleCardNavWithSessionIDModelClearsOnlyTargetSession(t *testing.T) {
+	key := "webnew:web-admin:project"
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "webnew"}}
+	agent := &stubModelModeAgent{model: "gpt-4.1-mini"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	first.AddHistory("user", "first-user")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+	second.AddHistory("user", "second-user")
+
+	card := e.handleCardNavWithSessionID("act:/model switch 1", key, first.ID)
+	if card == nil {
+		t.Fatal("expected model result card")
+	}
+	if got := first.GetAgentSessionID(); got != "" {
+		t.Fatalf("first AgentSessionID = %q, want cleared", got)
+	}
+	if got := len(first.GetHistory(0)); got != 0 {
+		t.Fatalf("first history len = %d, want cleared", got)
+	}
+	if got := second.GetAgentSessionID(); got != "agent-second" {
+		t.Fatalf("second AgentSessionID = %q, want unchanged", got)
+	}
+	if got := len(second.GetHistory(0)); got != 1 {
+		t.Fatalf("second history len = %d, want unchanged", got)
+	}
+}
+
+func TestHandleCardNavWithSessionIDDirClearsOnlyTargetSession(t *testing.T) {
+	key := "webnew:web-admin:project"
+	tempDir := t.TempDir()
+	dir1 := filepath.Join(tempDir, "a")
+	dir2 := filepath.Join(tempDir, "b")
+	dir3 := filepath.Join(tempDir, "c")
+	for _, dir := range []string{dir1, dir2, dir3} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %q: %v", dir, err)
+		}
+	}
+
+	agent := &stubWorkDirAgent{workDir: dir3}
+	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
+	e.SetDirHistory(NewDirHistory(t.TempDir()))
+	e.dirHistory.Add("test", dir1)
+	e.dirHistory.Add("test", dir2)
+	e.dirHistory.Add("test", dir3)
+
+	first := e.sessions.NewSession(key, "first")
+	first.SetAgentSessionID("agent-first", "stub")
+	first.AddHistory("user", "first-user")
+	second := e.sessions.NewSession(key, "second")
+	second.SetAgentSessionID("agent-second", "stub")
+	second.AddHistory("user", "second-user")
+
+	card := e.handleCardNavWithSessionID("act:/dir select 2", key, first.ID)
+	if card == nil {
+		t.Fatal("expected dir card")
+	}
+	if agent.workDir != dir2 {
+		t.Fatalf("workDir = %q, want %q", agent.workDir, dir2)
+	}
+	if got := first.GetAgentSessionID(); got != "" {
+		t.Fatalf("first AgentSessionID = %q, want cleared", got)
+	}
+	if got := len(first.GetHistory(0)); got != 0 {
+		t.Fatalf("first history len = %d, want cleared", got)
+	}
+	if got := second.GetAgentSessionID(); got != "agent-second" {
+		t.Fatalf("second AgentSessionID = %q, want unchanged", got)
+	}
+	if got := len(second.GetHistory(0)); got != 1 {
+		t.Fatalf("second history len = %d, want unchanged", got)
+	}
+}
+
+func TestCmdNewPreservesPreviousActiveSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	key := "test:user1"
+
+	old := e.sessions.GetOrCreateActive(key)
+	old.SetAgentSessionID("old-agent-session", "stub")
+	old.AddHistory("user", "keep this history")
+
+	e.cmdNew(p, &Message{SessionKey: key, ReplyCtx: "ctx"}, nil)
+
+	active := e.sessions.GetOrCreateActive(key)
+	if active.ID == old.ID {
+		t.Fatalf("/new kept old session active; active=%s old=%s", active.ID, old.ID)
+	}
+	if got := old.GetAgentSessionID(); got != "old-agent-session" {
+		t.Fatalf("old AgentSessionID = %q, want old-agent-session", got)
+	}
+	if history := old.GetHistory(0); len(history) != 1 || history[0].Content != "keep this history" {
+		t.Fatalf("old history = %#v, want preserved single entry", history)
+	}
+	if got := active.GetAgentSessionID(); got != "" {
+		t.Fatalf("new AgentSessionID = %q, want empty", got)
+	}
+	if history := active.GetHistory(0); len(history) != 0 {
+		t.Fatalf("new history = %#v, want empty", history)
 	}
 }
 

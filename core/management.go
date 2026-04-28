@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ type ProjectSettingsUpdate struct {
 	WorkDir              *string
 	Mode                 *string
 	ShowContextIndicator *bool
+	ReplyFooter          *bool
 	PlatformAllowFrom    map[string]string
 }
 
@@ -61,18 +64,20 @@ type ManagementServer struct {
 	cronScheduler      *CronScheduler
 	heartbeatScheduler *HeartbeatScheduler
 	bridgeServer       *BridgeServer
+	frontendRegistry   *FrontendAppRegistry
 
-	setupFeishuSave      func(req FeishuSetupSaveRequest) error
-	setupWeixinSave      func(req WeixinSetupSaveRequest) error
-	addPlatformToProject func(projectName, platType string, opts map[string]any, workDir, agentType string) error
-	createProject        func(projectName, displayName, workDir, agentType string) (string, bool, error)
-	removeProject        func(projectName string) error
-	saveProjectSettings  func(projectName string, update ProjectSettingsUpdate) error
-	getProjectConfig     func(projectName string) map[string]any
-	saveProviderRefs     func(projectName string, refs []string) error
-	configFilePath       string
-	getGlobalSettings    func() map[string]any
-	saveGlobalSettings   func(map[string]any) error
+	setupFeishuSave           func(req FeishuSetupSaveRequest) error
+	setupWeixinSave           func(req WeixinSetupSaveRequest) error
+	addPlatformToProject      func(projectName, platType string, opts map[string]any, workDir, agentType string) error
+	removePlatformFromProject func(projectName, selector string) error
+	createProject             func(projectName, displayName, workDir, agentType string) (string, bool, error)
+	removeProject             func(projectName string) error
+	saveProjectSettings       func(projectName string, update ProjectSettingsUpdate) error
+	getProjectConfig          func(projectName string) map[string]any
+	saveProviderRefs          func(projectName string, refs []string) error
+	configFilePath            string
+	getGlobalSettings         func() map[string]any
+	saveGlobalSettings        func(map[string]any) error
 
 	// Global provider callbacks (set by cmd/cc-connect)
 	listGlobalProviders  func() ([]GlobalProviderInfo, error)
@@ -102,6 +107,9 @@ func (m *ManagementServer) RegisterEngine(name string, e *Engine) {
 func (m *ManagementServer) SetCronScheduler(cs *CronScheduler)           { m.cronScheduler = cs }
 func (m *ManagementServer) SetHeartbeatScheduler(hs *HeartbeatScheduler) { m.heartbeatScheduler = hs }
 func (m *ManagementServer) SetBridgeServer(bs *BridgeServer)             { m.bridgeServer = bs }
+func (m *ManagementServer) SetFrontendAppRegistry(registry *FrontendAppRegistry) {
+	m.frontendRegistry = registry
+}
 func (m *ManagementServer) SetSetupFeishuSave(fn func(FeishuSetupSaveRequest) error) {
 	m.setupFeishuSave = fn
 }
@@ -111,6 +119,10 @@ func (m *ManagementServer) SetSetupWeixinSave(fn func(WeixinSetupSaveRequest) er
 
 func (m *ManagementServer) SetAddPlatformToProject(fn func(string, string, map[string]any, string, string) error) {
 	m.addPlatformToProject = fn
+}
+
+func (m *ManagementServer) SetRemovePlatformFromProject(fn func(string, string) error) {
+	m.removePlatformFromProject = fn
 }
 
 func (m *ManagementServer) SetCreateProject(fn func(string, string, string, string) (string, bool, error)) {
@@ -201,6 +213,7 @@ func (m *ManagementServer) buildHandler(mux *http.ServeMux) http.Handler {
 	mux.HandleFunc(prefix+"/reload", m.wrap(m.handleReload))
 	mux.HandleFunc(prefix+"/config", m.wrap(m.handleConfig))
 	mux.HandleFunc(prefix+"/settings", m.wrap(m.handleGlobalSettings))
+	mux.HandleFunc(prefix+"/filesystem/directories", m.wrap(m.handleFilesystemDirectories))
 
 	// Projects
 	mux.HandleFunc(prefix+"/projects", m.wrap(m.handleProjects))
@@ -224,6 +237,10 @@ func (m *ManagementServer) buildHandler(mux *http.ServeMux) http.Handler {
 
 	// Bridge
 	mux.HandleFunc(prefix+"/bridge/adapters", m.wrap(m.handleBridgeAdapters))
+
+	// Frontend app registry
+	mux.HandleFunc(prefix+"/apps", m.wrap(m.handleFrontendApps))
+	mux.HandleFunc(prefix+"/apps/", m.wrap(m.handleFrontendAppRoutes))
 
 	// Static file serving for cc-connect-web (SPA)
 	return m.withStaticFallback(mux)
@@ -354,6 +371,176 @@ func mgmtOK(w http.ResponseWriter, msg string) {
 }
 
 // ── System endpoints ──────────────────────────────────────────
+
+func (m *ManagementServer) handleFilesystemDirectories(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		path, err := resolveFilesystemDirectoryPath(r.URL.Query().Get("path"))
+		if err != nil {
+			mgmtError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		listing, err := listFilesystemDirectories(path)
+		if err != nil {
+			status := http.StatusBadRequest
+			if os.IsPermission(err) {
+				status = http.StatusForbidden
+			}
+			mgmtError(w, status, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusOK, listing)
+
+	case http.MethodPost:
+		var body struct {
+			Parent string `json:"parent"`
+			Path   string `json:"path"`
+			Name   string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		parent := strings.TrimSpace(body.Parent)
+		if parent == "" {
+			parent = strings.TrimSpace(body.Path)
+		}
+		parentPath, err := resolveFilesystemDirectoryPath(parent)
+		if err != nil {
+			mgmtError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		name := strings.TrimSpace(body.Name)
+		if err := validateNewDirectoryName(name); err != nil {
+			mgmtError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		target := filepath.Join(parentPath, name)
+		if err := os.Mkdir(target, 0o755); err != nil {
+			mgmtError(w, http.StatusBadRequest, "create directory: "+err.Error())
+			return
+		}
+		listing, err := listFilesystemDirectories(parentPath)
+		if err != nil {
+			mgmtError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusCreated, map[string]any{
+			"created": map[string]any{
+				"name":   name,
+				"path":   target,
+				"hidden": strings.HasPrefix(name, "."),
+			},
+			"listing": listing,
+		})
+
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
+	}
+}
+
+func resolveFilesystemDirectoryPath(raw string) (string, error) {
+	home, _ := os.UserHomeDir()
+	path := strings.TrimSpace(raw)
+	if path == "" {
+		path = home
+	}
+	if strings.HasPrefix(path, "~") {
+		if home == "" {
+			return "", fmt.Errorf("home directory is not available")
+		}
+		if path == "~" {
+			path = home
+		} else if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+			path = filepath.Join(home, strings.TrimLeft(path[1:], `/\`))
+		}
+	}
+	if path == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("resolve working directory: %w", err)
+		}
+		path = wd
+	}
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return "", fmt.Errorf("resolve path: %w", err)
+		}
+		path = abs
+	}
+	return filepath.Clean(path), nil
+}
+
+func listFilesystemDirectories(path string) (map[string]any, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read directory: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("path is not a directory")
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, fmt.Errorf("read directory: %w", err)
+	}
+	type directoryEntry struct {
+		Name   string `json:"name"`
+		Path   string `json:"path"`
+		Hidden bool   `json:"hidden"`
+	}
+	dirs := make([]directoryEntry, 0)
+	for _, entry := range entries {
+		entryPath := filepath.Join(path, entry.Name())
+		isDir := entry.IsDir()
+		if !isDir && entry.Type()&os.ModeSymlink != 0 {
+			if targetInfo, err := os.Stat(entryPath); err == nil && targetInfo.IsDir() {
+				isDir = true
+			}
+		}
+		if !isDir {
+			continue
+		}
+		dirs = append(dirs, directoryEntry{
+			Name:   entry.Name(),
+			Path:   entryPath,
+			Hidden: strings.HasPrefix(entry.Name(), "."),
+		})
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name)
+	})
+
+	parent := filepath.Dir(path)
+	if parent == path {
+		parent = ""
+	}
+	home, _ := os.UserHomeDir()
+	return map[string]any{
+		"path":      path,
+		"parent":    parent,
+		"home":      home,
+		"separator": string(os.PathSeparator),
+		"entries":   dirs,
+	}, nil
+}
+
+func validateNewDirectoryName(name string) error {
+	if name == "" {
+		return fmt.Errorf("directory name is required")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid directory name")
+	}
+	if filepath.IsAbs(name) || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("directory name must not contain path separators")
+	}
+	if filepath.Clean(name) != name {
+		return fmt.Errorf("invalid directory name")
+	}
+	return nil
+}
 
 func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -626,6 +813,8 @@ func (m *ManagementServer) handleProjectRoutes(w http.ResponseWriter, r *http.Re
 		m.handleProjectUsers(w, r, engine)
 	case "add-platform":
 		m.handleProjectAddPlatform(w, r, projName)
+	case "platforms":
+		m.handleProjectRemovePlatform(w, r, projName, rest)
 	default:
 		mgmtError(w, http.StatusNotFound, "not found")
 	}
@@ -689,6 +878,9 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		}
 		data["work_dir"] = workDir
 		data["agent_mode"] = agentMode
+		if switcher, ok := e.agent.(ModeSwitcher); ok {
+			data["permission_modes"] = switcher.PermissionModes()
+		}
 
 		if m.getProjectConfig != nil {
 			if extra := m.getProjectConfig(name); extra != nil {
@@ -711,6 +903,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 			WorkDir              *string           `json:"work_dir"`
 			Mode                 *string           `json:"mode"`
 			ShowContextIndicator *bool             `json:"show_context_indicator"`
+			ReplyFooter          *bool             `json:"reply_footer"`
 			PlatformAllowFrom    map[string]string `json:"platform_allow_from"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -755,6 +948,9 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		if body.ShowContextIndicator != nil {
 			e.SetShowContextIndicator(*body.ShowContextIndicator)
 		}
+		if body.ReplyFooter != nil {
+			e.SetReplyFooterEnabled(*body.ReplyFooter)
+		}
 
 		if m.saveProjectSettings != nil {
 			patch := ProjectSettingsUpdate{
@@ -765,6 +961,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 				WorkDir:              body.WorkDir,
 				Mode:                 body.Mode,
 				ShowContextIndicator: body.ShowContextIndicator,
+				ReplyFooter:          body.ReplyFooter,
 				PlatformAllowFrom:    body.PlatformAllowFrom,
 			}
 			if err := m.saveProjectSettings(name, patch); err != nil {
@@ -866,6 +1063,80 @@ func (m *ManagementServer) handleProjectUsers(w http.ResponseWriter, r *http.Req
 
 // ── Session endpoints ─────────────────────────────────────────
 
+type managementSessionLive struct {
+	activeKeys  map[string]string
+	bySessionID map[string]string
+	byKey       map[string]string
+	activeIDs   map[string]bool
+}
+
+func managementSessionLiveSnapshot(e *Engine, idToKey map[string]string, activeIDs map[string]bool) managementSessionLive {
+	live := managementSessionLive{
+		activeKeys:  make(map[string]string),
+		bySessionID: make(map[string]string),
+		byKey:       make(map[string]string),
+		activeIDs:   activeIDs,
+	}
+	if e == nil {
+		return live
+	}
+
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	for runtimeKey, state := range e.interactiveStates {
+		pName := ""
+		if state != nil && state.platform != nil {
+			pName = state.platform.Name()
+		}
+		live.activeKeys[runtimeKey] = pName
+
+		matchedSpecific := false
+		for sessionID, sessionKey := range idToKey {
+			if managementRuntimeKeyMatchesSession(runtimeKey, sessionKey, sessionID) {
+				live.bySessionID[sessionID] = pName
+				matchedSpecific = true
+			}
+		}
+		if matchedSpecific {
+			continue
+		}
+		for _, sessionKey := range idToKey {
+			if managementRuntimeKeyMatchesSessionKey(runtimeKey, sessionKey) {
+				live.byKey[sessionKey] = pName
+			}
+		}
+	}
+	return live
+}
+
+func (l managementSessionLive) platformForSession(sessionID, sessionKey string) (string, bool) {
+	if p, ok := l.bySessionID[sessionID]; ok {
+		return p, true
+	}
+	if !l.activeIDs[sessionID] {
+		return "", false
+	}
+	if p, ok := l.byKey[sessionKey]; ok {
+		return p, true
+	}
+	return "", false
+}
+
+func managementRuntimeKeyMatchesSession(runtimeKey, sessionKey, sessionID string) bool {
+	if runtimeKey == "" || sessionKey == "" || sessionID == "" {
+		return false
+	}
+	want := sessionKey + "::" + sessionID
+	return runtimeKey == want || strings.HasSuffix(runtimeKey, ":"+want)
+}
+
+func managementRuntimeKeyMatchesSessionKey(runtimeKey, sessionKey string) bool {
+	if runtimeKey == "" || sessionKey == "" {
+		return false
+	}
+	return runtimeKey == sessionKey || strings.HasSuffix(runtimeKey, ":"+sessionKey)
+}
+
 func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.Request, projName string, e *Engine, rest string) {
 	// sub-routes like /sessions/switch
 	if rest == "switch" {
@@ -879,18 +1150,8 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 
 	switch r.Method {
 	case http.MethodGet:
-		activeKeys := make(map[string]string) // sessionKey → platform
-		e.interactiveMu.Lock()
-		for key, state := range e.interactiveStates {
-			pName := ""
-			if state.platform != nil {
-				pName = state.platform.Name()
-			}
-			activeKeys[key] = pName
-		}
-		e.interactiveMu.Unlock()
-
 		idToKey, activeIDs := e.sessions.SessionKeyMap()
+		live := managementSessionLiveSnapshot(e, idToKey, activeIDs)
 		stored := e.sessions.AllSessions()
 		sessions := make([]map[string]any, 0, len(stored))
 		for _, s := range stored {
@@ -925,9 +1186,9 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 			s.mu.Unlock()
 
 			sessionKey := idToKey[s.ID]
-			_, live := activeKeys[sessionKey]
-			info["live"] = live
-			if p, ok := activeKeys[sessionKey]; ok {
+			livePlatform, sessionLive := live.platformForSession(s.ID, sessionKey)
+			info["live"] = sessionLive
+			if p := livePlatform; p != "" {
 				info["platform"] = p
 			} else if len(sessionKey) > 0 {
 				parts := splitSessionKey(sessionKey)
@@ -946,7 +1207,7 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 
 		mgmtJSON(w, http.StatusOK, map[string]any{
 			"sessions":    sessions,
-			"active_keys": activeKeys,
+			"active_keys": live.activeKeys,
 		})
 
 	case http.MethodPost:
@@ -963,15 +1224,18 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 			return
 		}
 
-		s := e.sessions.GetOrCreateActive(body.SessionKey)
-		if body.Name != "" {
-			s.Name = body.Name
+		name := strings.TrimSpace(body.Name)
+		if name == "" {
+			name = "default"
 		}
-		e.sessions.Save()
+		s := e.sessions.NewSession(body.SessionKey, name)
 
 		mgmtJSON(w, http.StatusOK, map[string]any{
+			"id":          s.ID,
 			"session_key": body.SessionKey,
-			"name":        s.Name,
+			"name":        s.GetName(),
+			"created_at":  s.CreatedAt,
+			"updated_at":  s.UpdatedAt,
 		})
 
 	default:
@@ -1007,9 +1271,8 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		idToKey, activeIDs := e.sessions.SessionKeyMap()
 		sessionKey := idToKey[s.ID]
 
-		e.interactiveMu.Lock()
-		_, live := e.interactiveStates[sessionKey]
-		e.interactiveMu.Unlock()
+		live := managementSessionLiveSnapshot(e, idToKey, activeIDs)
+		livePlatform, sessionLive := live.platformForSession(s.ID, sessionKey)
 
 		s.mu.Lock()
 		data := map[string]any{
@@ -1021,7 +1284,7 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 			"agent_session_id": s.AgentSessionID,
 			"agent_type":       s.AgentType,
 			"active":           activeIDs[s.ID],
-			"live":             live,
+			"live":             sessionLive,
 			"history_count":    len(s.History),
 			"created_at":       s.CreatedAt,
 			"updated_at":       s.UpdatedAt,
@@ -1029,7 +1292,9 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		}
 		s.mu.Unlock()
 
-		if len(sessionKey) > 0 {
+		if livePlatform != "" {
+			data["platform"] = livePlatform
+		} else if len(sessionKey) > 0 {
 			parts := splitSessionKey(sessionKey)
 			if len(parts) > 0 {
 				data["platform"] = parts[0]
@@ -1077,22 +1342,29 @@ func (m *ManagementServer) handleProjectSessionSwitch(w http.ResponseWriter, r *
 	var body struct {
 		SessionKey string `json:"session_key"`
 		SessionID  string `json:"session_id"`
+		Target     string `json:"target,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if body.SessionKey == "" || body.SessionID == "" {
+	sessionID := strings.TrimSpace(body.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(body.Target)
+	}
+	if body.SessionKey == "" || sessionID == "" {
 		mgmtError(w, http.StatusBadRequest, "session_key and session_id are required")
 		return
 	}
-	s, err := e.sessions.SwitchSession(body.SessionKey, body.SessionID)
+	s, err := e.sessions.SwitchSession(body.SessionKey, sessionID)
 	if err != nil {
 		mgmtError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	mgmtJSON(w, http.StatusOK, map[string]any{
 		"message":           "active session switched",
+		"session_key":       body.SessionKey,
+		"session_id":        s.ID,
 		"active_session_id": s.ID,
 	})
 }
@@ -1104,6 +1376,7 @@ func (m *ManagementServer) handleProjectSend(w http.ResponseWriter, r *http.Requ
 	}
 	var body struct {
 		SessionKey string `json:"session_key"`
+		SessionID  string `json:"session_id,omitempty"`
 		Message    string `json:"message"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1114,11 +1387,87 @@ func (m *ManagementServer) handleProjectSend(w http.ResponseWriter, r *http.Requ
 		mgmtError(w, http.StatusBadRequest, "message is required")
 		return
 	}
-	if err := e.SendToSession(body.SessionKey, body.Message); err != nil {
+
+	sessionKey := strings.TrimSpace(body.SessionKey)
+	sessionID := strings.TrimSpace(body.SessionID)
+	if sessionID != "" {
+		idToKey, _ := e.sessions.SessionKeyMap()
+		keyForID := idToKey[sessionID]
+		if keyForID == "" {
+			mgmtError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		if sessionKey == "" {
+			sessionKey = keyForID
+		} else if sessionKey != keyForID {
+			mgmtError(w, http.StatusBadRequest, "session_id does not belong to session_key")
+			return
+		}
+	}
+
+	var err error
+	if sessionID != "" {
+		err = e.SendToSessionID(sessionKey, sessionID, body.Message)
+	} else {
+		err = e.SendToSession(sessionKey, body.Message)
+	}
+	if err != nil {
 		mgmtError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	mgmtOK(w, "message sent")
+	data := map[string]any{"message": "message sent"}
+	if sessionKey != "" {
+		data["session_key"] = sessionKey
+	}
+	if sessionID != "" {
+		data["session_id"] = sessionID
+	}
+	mgmtJSON(w, http.StatusOK, data)
+}
+
+// SendToSessionID sends a message to a specific live cc-connect session under
+// a session_key. This preserves multi-conversation routing for management API
+// callers that provide session_id.
+func (e *Engine) SendToSessionID(sessionKey, sessionID, message string) error {
+	sessionKey = strings.TrimSpace(sessionKey)
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionKey == "" {
+		return fmt.Errorf("session_key is required")
+	}
+	if sessionID == "" {
+		return fmt.Errorf("session_id is required")
+	}
+	if message == "" {
+		return fmt.Errorf("message is required")
+	}
+
+	e.interactiveMu.Lock()
+	runtimeKey := interactiveKeyWithSessionID(e.interactiveKeyForSessionKey(sessionKey), sessionID)
+	state := e.interactiveStates[runtimeKey]
+	if state == nil {
+		plainRuntimeKey := interactiveKeyWithSessionID(sessionKey, sessionID)
+		if plainRuntimeKey != runtimeKey {
+			state = e.interactiveStates[plainRuntimeKey]
+		}
+	}
+	e.interactiveMu.Unlock()
+
+	if state == nil {
+		return fmt.Errorf("no active session found (key=%q session_id=%q)", sessionKey, sessionID)
+	}
+
+	state.mu.Lock()
+	p := state.platform
+	replyCtx := state.replyCtx
+	state.mu.Unlock()
+
+	if p == nil {
+		return fmt.Errorf("no active session found (key=%q session_id=%q)", sessionKey, sessionID)
+	}
+	if err := e.waitOutgoing(p); err != nil {
+		return err
+	}
+	return p.Send(e.ctx, replyCtx, message)
 }
 
 // ── Provider endpoints ────────────────────────────────────────
@@ -1628,6 +1977,288 @@ func (m *ManagementServer) listBridgeAdapters() []map[string]any {
 		})
 	}
 	return adapters
+}
+
+// ── Frontend app registry endpoints ───────────────────────────
+
+type frontendAppRequest struct {
+	ID          string            `json:"id"`
+	AppID       string            `json:"app_id"`
+	Name        string            `json:"name"`
+	Project     string            `json:"project"`
+	Description string            `json:"description"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+type frontendSlotRequest struct {
+	Slot            string            `json:"slot"`
+	Label           string            `json:"label"`
+	URL             string            `json:"url"`
+	APIBase         string            `json:"api_base"`
+	AdapterPlatform string            `json:"adapter_platform"`
+	Enabled         *bool             `json:"enabled"`
+	Metadata        map[string]string `json:"metadata"`
+}
+
+type frontendAppPatchRequest struct {
+	Name        *string           `json:"name"`
+	Project     *string           `json:"project"`
+	Description *string           `json:"description"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+type frontendSlotPatchRequest struct {
+	Label           *string           `json:"label"`
+	URL             *string           `json:"url"`
+	APIBase         *string           `json:"api_base"`
+	AdapterPlatform *string           `json:"adapter_platform"`
+	Enabled         *bool             `json:"enabled"`
+	Metadata        map[string]string `json:"metadata"`
+}
+
+func (m *ManagementServer) handleFrontendApps(w http.ResponseWriter, r *http.Request) {
+	if m.frontendRegistry == nil {
+		mgmtError(w, http.StatusServiceUnavailable, "frontend app registry not configured")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		apps, err := m.frontendRegistry.ListApps()
+		if err != nil {
+			mgmtError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"apps": apps})
+
+	case http.MethodPost:
+		var body frontendAppRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		id := strings.TrimSpace(body.ID)
+		if id == "" {
+			id = strings.TrimSpace(body.AppID)
+		}
+		app, err := m.frontendRegistry.CreateApp(FrontendApp{
+			ID:          id,
+			Name:        body.Name,
+			Project:     body.Project,
+			Description: body.Description,
+			Metadata:    body.Metadata,
+		})
+		if err != nil {
+			mgmtError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusCreated, map[string]any{"app": app})
+
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
+	}
+}
+
+func (m *ManagementServer) handleFrontendAppRoutes(w http.ResponseWriter, r *http.Request) {
+	if m.frontendRegistry == nil {
+		mgmtError(w, http.StatusServiceUnavailable, "frontend app registry not configured")
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/apps/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		mgmtError(w, http.StatusBadRequest, "app id required")
+		return
+	}
+	appID := parts[0]
+
+	if len(parts) == 1 {
+		m.handleFrontendAppDetail(w, r, appID)
+		return
+	}
+	if parts[1] != "slots" {
+		mgmtError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if len(parts) == 2 {
+		m.handleFrontendSlots(w, r, appID)
+		return
+	}
+	if strings.TrimSpace(parts[2]) == "" {
+		mgmtError(w, http.StatusBadRequest, "slot required")
+		return
+	}
+	if len(parts) == 3 {
+		m.handleFrontendSlotDetail(w, r, appID, parts[2])
+		return
+	}
+	if len(parts) == 4 && parts[3] == "promote" {
+		m.handleFrontendSlotPromote(w, r, appID, parts[2])
+		return
+	}
+	mgmtError(w, http.StatusNotFound, "not found")
+}
+
+func (m *ManagementServer) handleFrontendAppDetail(w http.ResponseWriter, r *http.Request, appID string) {
+	switch r.Method {
+	case http.MethodGet:
+		app, ok, err := m.frontendRegistry.GetApp(appID)
+		if err != nil {
+			mgmtError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !ok {
+			mgmtError(w, http.StatusNotFound, "frontend app not found")
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"app": app})
+
+	case http.MethodPatch:
+		var body frontendAppPatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		app, err := m.frontendRegistry.UpdateApp(appID, FrontendAppUpdate{
+			Name:        body.Name,
+			Project:     body.Project,
+			Description: body.Description,
+			Metadata:    body.Metadata,
+		})
+		if err != nil {
+			mgmtError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"app": app})
+
+	case http.MethodDelete:
+		if err := m.frontendRegistry.DeleteApp(appID); err != nil {
+			mgmtError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		mgmtOK(w, "frontend app deleted")
+
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET, PATCH, or DELETE only")
+	}
+}
+
+func (m *ManagementServer) handleFrontendSlots(w http.ResponseWriter, r *http.Request, appID string) {
+	switch r.Method {
+	case http.MethodGet:
+		slots, err := m.frontendRegistry.ListSlots(appID)
+		if err != nil {
+			mgmtError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"slots": slots})
+
+	case http.MethodPost:
+		var body frontendSlotRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		enabled := true
+		if body.Enabled != nil {
+			enabled = *body.Enabled
+		}
+		slot, err := m.frontendRegistry.UpsertSlot(appID, FrontendSlot{
+			Slot:            body.Slot,
+			Label:           body.Label,
+			URL:             body.URL,
+			APIBase:         body.APIBase,
+			AdapterPlatform: body.AdapterPlatform,
+			Enabled:         enabled,
+			Metadata:        body.Metadata,
+		})
+		if err != nil {
+			mgmtError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusCreated, map[string]any{"slot": slot})
+
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET or POST only")
+	}
+}
+
+func (m *ManagementServer) handleFrontendSlotDetail(w http.ResponseWriter, r *http.Request, appID, slotName string) {
+	switch r.Method {
+	case http.MethodGet:
+		app, ok, err := m.frontendRegistry.GetApp(appID)
+		if err != nil {
+			mgmtError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !ok {
+			mgmtError(w, http.StatusNotFound, "frontend app not found")
+			return
+		}
+		slot, ok := app.Slots[slotName]
+		if !ok {
+			mgmtError(w, http.StatusNotFound, "frontend slot not found")
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"slot": slot})
+
+	case http.MethodPatch:
+		var body frontendSlotPatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		slot, err := m.frontendRegistry.UpdateSlot(appID, slotName, FrontendSlotUpdate{
+			Label:           body.Label,
+			URL:             body.URL,
+			APIBase:         body.APIBase,
+			AdapterPlatform: body.AdapterPlatform,
+			Enabled:         body.Enabled,
+			Metadata:        body.Metadata,
+		})
+		if err != nil {
+			mgmtError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		mgmtJSON(w, http.StatusOK, map[string]any{"slot": slot})
+
+	case http.MethodDelete:
+		if err := m.frontendRegistry.DeleteSlot(appID, slotName); err != nil {
+			mgmtError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		mgmtOK(w, "frontend slot deleted")
+
+	default:
+		mgmtError(w, http.StatusMethodNotAllowed, "GET, PATCH, or DELETE only")
+	}
+}
+
+func (m *ManagementServer) handleFrontendSlotPromote(w http.ResponseWriter, r *http.Request, appID, sourceSlot string) {
+	if r.Method != http.MethodPost {
+		mgmtError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var body struct {
+		TargetSlot string `json:"target_slot"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	targetSlot := strings.TrimSpace(body.TargetSlot)
+	if targetSlot == "" {
+		targetSlot = "stable"
+	}
+	slot, err := m.frontendRegistry.PromoteSlot(appID, sourceSlot, targetSlot)
+	if err != nil {
+		mgmtError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	mgmtJSON(w, http.StatusOK, map[string]any{
+		"message": "frontend slot promoted",
+		"slot":    slot,
+	})
 }
 
 // ── Global provider endpoints ─────────────────────────────────

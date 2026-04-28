@@ -443,6 +443,44 @@ GET /api/v1/status?token=mgmt-secret
 
 ---
 
+#### DELETE /api/v1/projects/{name}/platforms/{selector}
+
+从项目配置中删除一个平台条目。该操作只修改配置；当前进程里的平台连接会继续保持，直到服务重启后才按新配置生效。
+
+**路径参数：**
+
+| 参数       | 类型   | 说明 |
+|------------|--------|------|
+| `name`     | string | 项目名称 |
+| `selector` | string | 平台的 0 基数字索引，如 `0`；或项目内唯一的平台类型 |
+
+如果同一个项目中有多个相同类型的平台，按类型删除会返回歧义错误；这种情况请使用数字索引。
+
+**响应：**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "message": "platform \"telegram\" removed from project \"my-backend\"",
+    "project": "my-backend",
+    "selector": "telegram",
+    "restart_required": true
+  }
+}
+```
+
+**错误：**
+
+| 状态码 | 含义 |
+|--------|------|
+| `400`  | selector 缺失或非法 |
+| `404`  | 项目或平台 selector 不存在 |
+| `409`  | 平台类型 selector 有歧义 |
+| `405`  | 请求方法不是 `DELETE` |
+
+---
+
 ### 5.3 会话
 
 会话是项目内的对话上下文。会话由 `session_key`（格式：`platform:chatId:userId`）标识，命名会话还可通过内部 `id` 标识（例如 `/new work` 会创建命名会话）。
@@ -477,7 +515,7 @@ GET /api/v1/status?token=mgmt-secret
 
 #### POST /api/v1/projects/{name}/sessions
 
-创建新会话。
+在指定 `session_key` 下创建新的对话会话。该接口总是创建一条独立会话，不会返回或覆盖当前活跃会话。
 
 **请求体：**
 
@@ -502,7 +540,8 @@ GET /api/v1/status?token=mgmt-secret
     "id": "sess_xyz789",
     "session_key": "telegram:123:456",
     "name": "work",
-    "created_at": "2026-03-10T10:35:00Z"
+    "created_at": "2026-03-10T10:35:00Z",
+    "updated_at": "2026-03-10T10:35:00Z"
   }
 }
 ```
@@ -600,6 +639,8 @@ GET /api/v1/status?token=mgmt-secret
   "ok": true,
   "data": {
     "message": "active session switched",
+    "session_key": "telegram:123:456",
+    "session_id": "sess_xyz789",
     "active_session_id": "sess_xyz789"
   }
 }
@@ -611,18 +652,22 @@ GET /api/v1/status?token=mgmt-secret
 
 向会话发送消息。消息会像用户通过平台发送一样传递给 Agent。
 
+提供 `session_id` 时，目标会话必须是 live 状态，并且会按该具体对话路由；不提供 `session_id` 时保留旧的活跃会话行为。
+
 **请求体：**
 
 ```json
 {
   "session_key": "telegram:123:456",
+  "session_id": "sess_xyz789",
   "message": "Review the latest commit"
 }
 ```
 
 | 字段          | 类型   | 必填 | 说明                    |
 |---------------|--------|------|-------------------------|
-| `session_key` | string | 是   | 平台路由键              |
+| `session_key` | string | 是*  | 平台路由键。提供 `session_id` 时可省略。 |
+| `session_id`  | string | 否   | `session_key` 下的具体对话；提供后会定向发送到该 live 对话。旧客户端可省略以使用活跃会话行为。 |
 | `message`     | string | 是   | 发送给 Agent 的文本     |
 
 **响应：**
@@ -631,7 +676,9 @@ GET /api/v1/status?token=mgmt-secret
 {
   "ok": true,
   "data": {
-    "message": "message sent"
+    "message": "message sent",
+    "session_key": "telegram:123:456",
+    "session_id": "sess_xyz789"
   }
 }
 ```

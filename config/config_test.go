@@ -2224,6 +2224,83 @@ func TestAddPlatformToProject_NewProjectClonesAgentWhenAgentTypeEmpty(t *testing
 	}
 }
 
+func TestRemovePlatformFromProject_ByIndex(t *testing.T) {
+	configPath := writeConfigFixture(t, feishuConfigFixture)
+	patchConfigPath(t, configPath)
+
+	if err := RemovePlatformFromProject("alpha", "0"); err != nil {
+		t.Fatalf("RemovePlatformFromProject: %v", err)
+	}
+	cfg := readConfigFixture(t, configPath)
+	platforms := cfg.Projects[0].Platforms
+	if len(platforms) != 2 {
+		t.Fatalf("platforms len = %d, want 2", len(platforms))
+	}
+	if platforms[0].Type != "feishu" || platforms[1].Type != "lark" {
+		t.Fatalf("platforms = %#v, want feishu/lark", platforms)
+	}
+}
+
+func TestRemovePlatformFromProject_ByUniqueType(t *testing.T) {
+	configPath := writeConfigFixture(t, feishuConfigFixture)
+	patchConfigPath(t, configPath)
+
+	if err := RemovePlatformFromProject("alpha", "feishu"); err != nil {
+		t.Fatalf("RemovePlatformFromProject: %v", err)
+	}
+	cfg := readConfigFixture(t, configPath)
+	platforms := cfg.Projects[0].Platforms
+	if len(platforms) != 2 {
+		t.Fatalf("platforms len = %d, want 2", len(platforms))
+	}
+	if platforms[0].Type != "telegram" || platforms[1].Type != "lark" {
+		t.Fatalf("platforms = %#v, want telegram/lark", platforms)
+	}
+}
+
+func TestRemovePlatformFromProject_AmbiguousType(t *testing.T) {
+	fixture := strings.Replace(feishuConfigFixture, `type = "feishu"`, `type = "telegram"`, 1)
+	configPath := writeConfigFixture(t, fixture)
+	patchConfigPath(t, configPath)
+
+	err := RemovePlatformFromProject("alpha", "telegram")
+	if err == nil {
+		t.Fatal("expected ambiguous selector error")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("error = %q, want ambiguous", err.Error())
+	}
+	var cfgErr *ConfigOperationError
+	if !strings.Contains(err.Error(), "use a numeric index") {
+		t.Fatalf("error = %q, want numeric index guidance", err.Error())
+	}
+	if e, ok := err.(*ConfigOperationError); ok {
+		cfgErr = e
+	}
+	if cfgErr == nil || cfgErr.ConfigErrorKind() != ConfigErrorKindPlatformAmbiguous {
+		t.Fatalf("error kind = %#v, want %q", cfgErr, ConfigErrorKindPlatformAmbiguous)
+	}
+	cfg := readConfigFixture(t, configPath)
+	if len(cfg.Projects[0].Platforms) != 3 {
+		t.Fatalf("platforms len = %d, want unchanged 3", len(cfg.Projects[0].Platforms))
+	}
+}
+
+func TestRemovePlatformFromProject_NotFoundErrors(t *testing.T) {
+	configPath := writeConfigFixture(t, feishuConfigFixture)
+	patchConfigPath(t, configPath)
+
+	err := RemovePlatformFromProject("missing", "0")
+	if err == nil || !strings.Contains(err.Error(), `project "missing" not found`) {
+		t.Fatalf("project missing error = %v", err)
+	}
+
+	err = RemovePlatformFromProject("alpha", "discord")
+	if err == nil || !strings.Contains(err.Error(), `platform selector "discord" not found`) {
+		t.Fatalf("platform missing error = %v", err)
+	}
+}
+
 func TestFormatTOML(t *testing.T) {
 	tests := []struct {
 		name, input, want string

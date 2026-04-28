@@ -58,6 +58,7 @@ type bridgeAdapter struct {
 type bridgeReplyCtx struct {
 	Platform   string `json:"platform"`
 	SessionKey string `json:"session_key"`
+	SessionID  string `json:"session_id,omitempty"`
 	ReplyCtx   string `json:"reply_ctx"`
 
 	progressStyle               string `json:"-"`
@@ -108,6 +109,7 @@ type bridgeMessage struct {
 	Type       string            `json:"type"`
 	MsgID      string            `json:"msg_id"`
 	SessionKey string            `json:"session_key"`
+	SessionID  string            `json:"session_id,omitempty"`
 	UserID     string            `json:"user_id"`
 	UserName   string            `json:"user_name,omitempty"`
 	Content    string            `json:"content"`
@@ -121,6 +123,7 @@ type bridgeMessage struct {
 type bridgeCardAction struct {
 	Type       string `json:"type"`
 	SessionKey string `json:"session_key"`
+	SessionID  string `json:"session_id,omitempty"`
 	Action     string `json:"action"`
 	ReplyCtx   string `json:"reply_ctx"`
 	Project    string `json:"project,omitempty"`
@@ -276,24 +279,26 @@ func (bs *BridgeServer) ConnectedAdapters() []string {
 // BridgePlatform implements core.Platform for a single project.
 // It is a lightweight handle; the actual WebSocket server lives in BridgeServer.
 type BridgePlatform struct {
-	server     *BridgeServer
-	project    string
-	handler    MessageHandler
-	navHandler CardNavigationHandler
+	server                  *BridgeServer
+	project                 string
+	handler                 MessageHandler
+	navHandler              CardNavigationHandler
+	navHandlerWithSessionID CardNavigationHandlerWithSessionID
 }
 
 // Compile-time interface checks.
 var (
-	_ Platform                  = (*BridgePlatform)(nil)
-	_ CardSender                = (*BridgePlatform)(nil)
-	_ InlineButtonSender        = (*BridgePlatform)(nil)
-	_ MessageUpdater            = (*BridgePlatform)(nil)
-	_ PreviewStarter            = (*BridgePlatform)(nil)
-	_ PreviewCleaner            = (*BridgePlatform)(nil)
-	_ TypingIndicator           = (*BridgePlatform)(nil)
-	_ AudioSender               = (*BridgePlatform)(nil)
-	_ CardNavigable             = (*BridgePlatform)(nil)
-	_ ReplyContextReconstructor = (*BridgePlatform)(nil)
+	_ Platform                   = (*BridgePlatform)(nil)
+	_ CardSender                 = (*BridgePlatform)(nil)
+	_ InlineButtonSender         = (*BridgePlatform)(nil)
+	_ MessageUpdater             = (*BridgePlatform)(nil)
+	_ PreviewStarter             = (*BridgePlatform)(nil)
+	_ PreviewCleaner             = (*BridgePlatform)(nil)
+	_ TypingIndicator            = (*BridgePlatform)(nil)
+	_ AudioSender                = (*BridgePlatform)(nil)
+	_ CardNavigable              = (*BridgePlatform)(nil)
+	_ CardNavigableWithSessionID = (*BridgePlatform)(nil)
+	_ ReplyContextReconstructor  = (*BridgePlatform)(nil)
 )
 
 func (bp *BridgePlatform) Name() string { return "bridge" }
@@ -310,13 +315,11 @@ func (bp *BridgePlatform) Reply(ctx context.Context, replyCtx any, content strin
 	if !ok {
 		return fmt.Errorf("bridge: invalid reply context type %T", replyCtx)
 	}
-	return bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":        "reply",
-		"session_key": rc.SessionKey,
-		"reply_ctx":   rc.ReplyCtx,
-		"content":     content,
-		"format":      "text",
-	})
+	payload := bridgeOutboundBase("reply", rc)
+	payload["reply_ctx"] = rc.ReplyCtx
+	payload["content"] = content
+	payload["format"] = "text"
+	return bp.server.sendToAdapter(rc.Platform, payload)
 }
 
 func (bp *BridgePlatform) Send(ctx context.Context, replyCtx any, content string) error {
@@ -343,8 +346,13 @@ func (bp *BridgePlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
 }
 
 func newBridgeReplyCtx(a *bridgeAdapter, sessionKey, replyCtx string) *bridgeReplyCtx {
+	return newBridgeReplyCtxWithSessionID(a, sessionKey, "", replyCtx)
+}
+
+func newBridgeReplyCtxWithSessionID(a *bridgeAdapter, sessionKey, sessionID, replyCtx string) *bridgeReplyCtx {
 	rc := &bridgeReplyCtx{
 		SessionKey: sessionKey,
+		SessionID:  strings.TrimSpace(sessionID),
 		ReplyCtx:   replyCtx,
 	}
 	if a == nil {
@@ -354,6 +362,24 @@ func newBridgeReplyCtx(a *bridgeAdapter, sessionKey, replyCtx string) *bridgeRep
 	rc.progressStyle = bridgeProgressStyleForAdapter(a)
 	rc.supportsProgressCardPayload = bridgeSupportsProgressCardPayloadForAdapter(a)
 	return rc
+}
+
+func bridgeOutboundBase(msgType string, rc *bridgeReplyCtx) map[string]any {
+	payload := map[string]any{
+		"type":        msgType,
+		"session_key": rc.SessionKey,
+	}
+	if sessionID := strings.TrimSpace(rc.SessionID); sessionID != "" {
+		payload["session_id"] = sessionID
+	}
+	return payload
+}
+
+func bridgeAddSessionID(payload map[string]any, sessionID string) map[string]any {
+	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+		payload["session_id"] = sessionID
+	}
+	return payload
 }
 
 func bridgeProgressStyleForAdapter(a *bridgeAdapter) string {
@@ -453,12 +479,10 @@ func (bp *BridgePlatform) SendCard(ctx context.Context, replyCtx any, card *Card
 	if a == nil || !a.capabilities["card"] {
 		return bp.Reply(ctx, replyCtx, card.RenderText())
 	}
-	return bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":        "card",
-		"session_key": rc.SessionKey,
-		"reply_ctx":   rc.ReplyCtx,
-		"card":        serializeCard(card),
-	})
+	payload := bridgeOutboundBase("card", rc)
+	payload["reply_ctx"] = rc.ReplyCtx
+	payload["card"] = serializeCard(card)
+	return bp.server.sendToAdapter(rc.Platform, payload)
 }
 
 func (bp *BridgePlatform) ReplyCard(ctx context.Context, replyCtx any, card *Card) error {
@@ -474,13 +498,11 @@ func (bp *BridgePlatform) SendWithButtons(ctx context.Context, replyCtx any, con
 	if a == nil || !a.capabilities["buttons"] {
 		return bp.Reply(ctx, replyCtx, content)
 	}
-	return bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":        "buttons",
-		"session_key": rc.SessionKey,
-		"reply_ctx":   rc.ReplyCtx,
-		"content":     content,
-		"buttons":     buttons,
-	})
+	payload := bridgeOutboundBase("buttons", rc)
+	payload["reply_ctx"] = rc.ReplyCtx
+	payload["content"] = content
+	payload["buttons"] = buttons
+	return bp.server.sendToAdapter(rc.Platform, payload)
 }
 
 func (bp *BridgePlatform) UpdateMessage(ctx context.Context, replyCtx any, content string) error {
@@ -492,12 +514,10 @@ func (bp *BridgePlatform) UpdateMessage(ctx context.Context, replyCtx any, conte
 	if a == nil || !a.capabilities["update_message"] {
 		return ErrNotSupported
 	}
-	return bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":           "update_message",
-		"session_key":    rc.SessionKey,
-		"preview_handle": rc.ReplyCtx,
-		"content":        content,
-	})
+	payload := bridgeOutboundBase("update_message", rc)
+	payload["preview_handle"] = rc.ReplyCtx
+	payload["content"] = content
+	return bp.server.sendToAdapter(rc.Platform, payload)
 }
 
 func (bp *BridgePlatform) SendPreviewStart(ctx context.Context, replyCtx any, content string) (previewHandle any, err error) {
@@ -517,13 +537,11 @@ func (bp *BridgePlatform) SendPreviewStart(ctx context.Context, replyCtx any, co
 	a.previewRequests[refID] = ch
 	a.previewMu.Unlock()
 
-	if err := bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":        "preview_start",
-		"ref_id":      refID,
-		"session_key": rc.SessionKey,
-		"reply_ctx":   rc.ReplyCtx,
-		"content":     content,
-	}); err != nil {
+	payload := bridgeOutboundBase("preview_start", rc)
+	payload["ref_id"] = refID
+	payload["reply_ctx"] = rc.ReplyCtx
+	payload["content"] = content
+	if err := bp.server.sendToAdapter(rc.Platform, payload); err != nil {
 		a.previewMu.Lock()
 		delete(a.previewRequests, refID)
 		a.previewMu.Unlock()
@@ -532,7 +550,7 @@ func (bp *BridgePlatform) SendPreviewStart(ctx context.Context, replyCtx any, co
 
 	select {
 	case handle := <-ch:
-		return newBridgeReplyCtx(a, rc.SessionKey, handle), nil
+		return newBridgeReplyCtxWithSessionID(a, rc.SessionKey, rc.SessionID, handle), nil
 	case <-time.After(10 * time.Second):
 		a.previewMu.Lock()
 		delete(a.previewRequests, refID)
@@ -555,11 +573,9 @@ func (bp *BridgePlatform) DeletePreviewMessage(ctx context.Context, previewHandl
 	if a == nil || !a.capabilities["delete_message"] {
 		return ErrNotSupported
 	}
-	return bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":           "delete_message",
-		"session_key":    rc.SessionKey,
-		"preview_handle": rc.ReplyCtx,
-	})
+	payload := bridgeOutboundBase("delete_message", rc)
+	payload["preview_handle"] = rc.ReplyCtx
+	return bp.server.sendToAdapter(rc.Platform, payload)
 }
 
 func (bp *BridgePlatform) StartTyping(ctx context.Context, replyCtx any) (stop func()) {
@@ -571,17 +587,13 @@ func (bp *BridgePlatform) StartTyping(ctx context.Context, replyCtx any) (stop f
 	if a == nil || !a.capabilities["typing"] {
 		return func() {}
 	}
-	_ = bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":        "typing_start",
-		"session_key": rc.SessionKey,
-		"reply_ctx":   rc.ReplyCtx,
-	})
+	startPayload := bridgeOutboundBase("typing_start", rc)
+	startPayload["reply_ctx"] = rc.ReplyCtx
+	_ = bp.server.sendToAdapter(rc.Platform, startPayload)
 	return func() {
-		_ = bp.server.sendToAdapter(rc.Platform, map[string]any{
-			"type":        "typing_stop",
-			"session_key": rc.SessionKey,
-			"reply_ctx":   rc.ReplyCtx,
-		})
+		stopPayload := bridgeOutboundBase("typing_stop", rc)
+		stopPayload["reply_ctx"] = rc.ReplyCtx
+		_ = bp.server.sendToAdapter(rc.Platform, stopPayload)
 	}
 }
 
@@ -594,17 +606,19 @@ func (bp *BridgePlatform) SendAudio(ctx context.Context, replyCtx any, audio []b
 	if a == nil || !a.capabilities["audio"] {
 		return ErrNotSupported
 	}
-	return bp.server.sendToAdapter(rc.Platform, map[string]any{
-		"type":        "audio",
-		"session_key": rc.SessionKey,
-		"reply_ctx":   rc.ReplyCtx,
-		"data":        base64.StdEncoding.EncodeToString(audio),
-		"format":      format,
-	})
+	payload := bridgeOutboundBase("audio", rc)
+	payload["reply_ctx"] = rc.ReplyCtx
+	payload["data"] = base64.StdEncoding.EncodeToString(audio)
+	payload["format"] = format
+	return bp.server.sendToAdapter(rc.Platform, payload)
 }
 
 func (bp *BridgePlatform) SetCardNavigationHandler(h CardNavigationHandler) {
 	bp.navHandler = h
+}
+
+func (bp *BridgePlatform) SetCardNavigationHandlerWithSessionID(h CardNavigationHandlerWithSessionID) {
+	bp.navHandlerWithSessionID = h
 }
 
 // ---------------------------------------------------------------------------
@@ -767,12 +781,13 @@ func (a *bridgeAdapter) handleMessage(raw json.RawMessage) {
 
 	msg := &Message{
 		SessionKey: m.SessionKey,
+		SessionID:  m.SessionID,
 		Platform:   a.platform,
 		MessageID:  m.MsgID,
 		UserID:     m.UserID,
 		UserName:   m.UserName,
 		Content:    m.Content,
-		ReplyCtx:   newBridgeReplyCtx(a, m.SessionKey, m.ReplyCtx),
+		ReplyCtx:   newBridgeReplyCtxWithSessionID(a, m.SessionKey, m.SessionID, m.ReplyCtx),
 	}
 
 	for _, img := range m.Images {
@@ -808,7 +823,7 @@ func (a *bridgeAdapter) handleMessage(raw json.RawMessage) {
 
 	slog.Info("bridge: message received",
 		"platform", a.platform, "session_key", m.SessionKey,
-		"user", m.UserID, "content_len", len(m.Content),
+		"session_id", m.SessionID, "user", m.UserID, "content_len", len(m.Content),
 	)
 
 	if ref.platform.handler != nil {
@@ -823,7 +838,7 @@ func (a *bridgeAdapter) handleCardAction(raw json.RawMessage) {
 		return
 	}
 
-	slog.Debug("bridge: card_action", "platform", a.platform, "action", ca.Action, "session_key", ca.SessionKey, "project", ca.Project)
+	slog.Debug("bridge: card_action", "platform", a.platform, "action", ca.Action, "session_key", ca.SessionKey, "session_id", ca.SessionID, "project", ca.Project)
 
 	ref := a.server.resolveEngine(ca.SessionKey, ca.Project)
 	if ref == nil {
@@ -843,59 +858,63 @@ func (a *bridgeAdapter) handleCardAction(raw json.RawMessage) {
 		default:
 			return
 		}
-		a.dispatchAsMessage(ref, ca.SessionKey, ca.ReplyCtx, responseText)
+		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, responseText)
 		return
 	}
 
 	// askq: — AskUserQuestion answer; forward as a regular message
 	if strings.HasPrefix(ca.Action, "askq:") {
-		a.dispatchAsMessage(ref, ca.SessionKey, ca.ReplyCtx, ca.Action)
+		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, ca.Action)
 		return
 	}
 
 	// cmd: — command shortcut from a card button; forward as a message
 	if strings.HasPrefix(ca.Action, "cmd:") {
 		cmdText := strings.TrimPrefix(ca.Action, "cmd:")
-		a.dispatchAsMessage(ref, ca.SessionKey, ca.ReplyCtx, cmdText)
+		a.dispatchAsMessage(ref, ca.SessionKey, ca.SessionID, ca.ReplyCtx, cmdText)
 		return
 	}
 
 	// nav: / act: — card navigation and in-place updates
-	if ref.platform.navHandler == nil {
+	var card *Card
+	if ref.platform.navHandlerWithSessionID != nil {
+		card = ref.platform.navHandlerWithSessionID(ca.Action, ca.SessionKey, ca.SessionID)
+	} else if ref.platform.navHandler != nil {
+		card = ref.platform.navHandler(ca.Action, ca.SessionKey)
+	} else {
 		return
 	}
-
-	card := ref.platform.navHandler(ca.Action, ca.SessionKey)
 	if card == nil {
 		return
 	}
 
 	if a.capabilities["card"] {
-		_ = a.server.sendToAdapter(a.platform, map[string]any{
+		_ = a.server.sendToAdapter(a.platform, bridgeAddSessionID(map[string]any{
 			"type":        "card",
 			"session_key": ca.SessionKey,
 			"reply_ctx":   ca.ReplyCtx,
 			"card":        serializeCard(card),
-		})
+		}, ca.SessionID))
 	} else {
-		rc := newBridgeReplyCtx(a, ca.SessionKey, ca.ReplyCtx)
+		rc := newBridgeReplyCtxWithSessionID(a, ca.SessionKey, ca.SessionID, ca.ReplyCtx)
 		_ = ref.platform.Reply(context.Background(), rc, card.RenderText())
 	}
 }
 
 // dispatchAsMessage converts a card action into a regular user message
 // and dispatches it to the engine's message handler.
-func (a *bridgeAdapter) dispatchAsMessage(ref *bridgeEngineRef, sessionKey, replyCtx, content string) {
+func (a *bridgeAdapter) dispatchAsMessage(ref *bridgeEngineRef, sessionKey, sessionID, replyCtx, content string) {
 	if ref.platform.handler == nil {
 		return
 	}
 	msg := &Message{
 		SessionKey: sessionKey,
+		SessionID:  sessionID,
 		Platform:   a.platform,
 		UserID:     "web-admin",
 		UserName:   "Web Admin",
 		Content:    content,
-		ReplyCtx:   newBridgeReplyCtx(a, sessionKey, replyCtx),
+		ReplyCtx:   newBridgeReplyCtxWithSessionID(a, sessionKey, sessionID, replyCtx),
 	}
 	go ref.platform.handler(ref.platform, msg)
 }
@@ -949,6 +968,32 @@ func bridgeError(w http.ResponseWriter, status int, msg string) {
 	}
 }
 
+func bridgeSessionForKey(sm *SessionManager, sessionKey, sessionID string) (*Session, bool) {
+	if sm == nil || sessionKey == "" || sessionID == "" {
+		return nil, false
+	}
+	for _, s := range sm.ListSessions(sessionKey) {
+		if s != nil && s.ID == sessionID {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+func bridgeSessionSummary(sessionKey, activeID string, s *Session) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return map[string]any{
+		"id":            s.ID,
+		"session_key":   sessionKey,
+		"name":          s.Name,
+		"active":        s.ID == activeID,
+		"history_count": len(s.History),
+		"created_at":    s.CreatedAt,
+		"updated_at":    s.UpdatedAt,
+	}
+}
+
 // resolveEngineForSessionKey returns the engine ref for a given session key and optional project.
 func (bs *BridgeServer) resolveEngineForSessionKey(sessionKey, project string) *bridgeEngineRef {
 	return bs.resolveEngine(sessionKey, project)
@@ -973,13 +1018,9 @@ func (bs *BridgeServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 		sessions := ref.engine.sessions.ListSessions(sessionKey)
 		activeID := ref.engine.sessions.ActiveSessionID(sessionKey)
 
-		list := make([]map[string]any, len(sessions))
-		for i, s := range sessions {
-			list[i] = map[string]any{
-				"id":            s.ID,
-				"name":          s.GetName(),
-				"history_count": len(s.History),
-			}
+		list := make([]map[string]any, 0, len(sessions))
+		for _, s := range sessions {
+			list = append(list, bridgeSessionSummary(sessionKey, activeID, s))
 		}
 
 		bridgeJSON(w, http.StatusOK, map[string]any{
@@ -1012,9 +1053,12 @@ func (bs *BridgeServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		s := ref.engine.sessions.NewSession(body.SessionKey, name)
 		bridgeJSON(w, http.StatusOK, map[string]any{
-			"id":      s.ID,
-			"name":    s.GetName(),
-			"message": "session created",
+			"id":          s.ID,
+			"session_key": body.SessionKey,
+			"name":        s.GetName(),
+			"created_at":  s.CreatedAt,
+			"updated_at":  s.UpdatedAt,
+			"message":     "session created",
 		})
 
 	default:
@@ -1051,8 +1095,8 @@ func (bs *BridgeServer) handleSessionRoutes(w http.ResponseWriter, r *http.Reque
 
 	switch r.Method {
 	case http.MethodGet:
-		s := ref.engine.sessions.FindByID(sub)
-		if s == nil {
+		s, ok := bridgeSessionForKey(ref.engine.sessions, sessionKey, sub)
+		if !ok {
 			bridgeError(w, http.StatusNotFound, "session not found")
 			return
 		}
@@ -1071,12 +1115,19 @@ func (bs *BridgeServer) handleSessionRoutes(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		bridgeJSON(w, http.StatusOK, map[string]any{
-			"id":      s.ID,
-			"name":    s.GetName(),
-			"history": histJSON,
+			"id":          s.ID,
+			"session_key": sessionKey,
+			"name":        s.GetName(),
+			"created_at":  s.CreatedAt,
+			"updated_at":  s.UpdatedAt,
+			"history":     histJSON,
 		})
 
 	case http.MethodDelete:
+		if _, ok := bridgeSessionForKey(ref.engine.sessions, sessionKey, sub); !ok {
+			bridgeError(w, http.StatusNotFound, "session not found")
+			return
+		}
 		if ref.engine.sessions.DeleteByID(sub) {
 			bridgeJSON(w, http.StatusOK, map[string]string{"message": "session deleted"})
 		} else {
@@ -1096,6 +1147,7 @@ func (bs *BridgeServer) handleSessionSwitch(w http.ResponseWriter, r *http.Reque
 	}
 	var body struct {
 		SessionKey string `json:"session_key"`
+		SessionID  string `json:"session_id,omitempty"`
 		Target     string `json:"target"`
 		Project    string `json:"project,omitempty"`
 	}
@@ -1103,8 +1155,12 @@ func (bs *BridgeServer) handleSessionSwitch(w http.ResponseWriter, r *http.Reque
 		bridgeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if body.SessionKey == "" || body.Target == "" {
-		bridgeError(w, http.StatusBadRequest, "session_key and target are required")
+	target := strings.TrimSpace(body.SessionID)
+	if target == "" {
+		target = strings.TrimSpace(body.Target)
+	}
+	if body.SessionKey == "" || target == "" {
+		bridgeError(w, http.StatusBadRequest, "session_key and session_id are required")
 		return
 	}
 	ref := bs.resolveEngineForSessionKey(body.SessionKey, body.Project)
@@ -1112,13 +1168,15 @@ func (bs *BridgeServer) handleSessionSwitch(w http.ResponseWriter, r *http.Reque
 		bridgeError(w, http.StatusNotFound, "no engine found for session key")
 		return
 	}
-	s, err := ref.engine.sessions.SwitchSession(body.SessionKey, body.Target)
+	s, err := ref.engine.sessions.SwitchSession(body.SessionKey, target)
 	if err != nil {
 		bridgeError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	bridgeJSON(w, http.StatusOK, map[string]any{
 		"message":           "session switched",
+		"session_key":       body.SessionKey,
+		"session_id":        s.ID,
 		"active_session_id": s.ID,
 	})
 }

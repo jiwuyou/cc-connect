@@ -131,6 +131,7 @@ Delivers an incoming user message to the engine.
   "type": "message",
   "msg_id": "msg-001",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "user_id": "user123",
   "user_name": "Alice",
   "content": "Hello, what can you do?",
@@ -148,6 +149,7 @@ Delivers an incoming user message to the engine.
 | `type` | string | yes | `"message"` |
 | `msg_id` | string | yes | Platform-specific message ID for tracing. |
 | `session_key` | string | yes | Unique session identifier. Format: `{platform}:{scope}:{user}`. The adapter defines how to compose this. |
+| `session_id` | string | no | cc-connect conversation ID under `session_key`. Omit for legacy active-session behavior. |
 | `user_id` | string | yes | User identifier on the platform. |
 | `user_name` | string | no | Display name. |
 | `content` | string | yes | Text content. |
@@ -164,6 +166,7 @@ User clicked a button or selected an option on a card.
 {
   "type": "card_action",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "action": "cmd:/new",
   "reply_ctx": "conv-abc-123"
 }
@@ -175,6 +178,7 @@ User clicked a button or selected an option on a card.
 |-------|------|----------|-------------|
 | `type` | string | yes | `"card_action"` |
 | `session_key` | string | yes | Session that triggered the action. |
+| `session_id` | string | no | cc-connect conversation ID under `session_key`. Message-like actions (`perm:`, `askq:`, `cmd:`) are routed to this conversation. Reply/update payloads echo it when supplied. In-place `nav:`/`act:` handlers currently receive only `session_key`, but the returned payload still echoes `session_id`. Omit for legacy active-session behavior. |
 | `action` | string | yes | The callback value from the button (e.g., `"cmd:/new"`, `"nav:/model"`, `"act:/heartbeat pause"`). |
 | `reply_ctx` | string | yes | Reply context for routing the response. |
 
@@ -225,6 +229,7 @@ A complete reply message to send to the user.
 {
   "type": "reply",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "content": "I can help you with coding tasks!",
   "format": "text"
@@ -237,6 +242,7 @@ A complete reply message to send to the user.
 |-------|------|----------|-------------|
 | `type` | string | yes | `"reply"` |
 | `session_key` | string | yes | Target session. |
+| `session_id` | string | no | cc-connect conversation ID when the incoming message/action supplied one. |
 | `reply_ctx` | string | yes | Echoed from the original message. |
 | `content` | string | yes | Reply text content. |
 | `format` | string | no | `"text"` (default) or `"markdown"`. |
@@ -249,6 +255,7 @@ Streaming delta for real-time typing preview. Only sent if the adapter declared 
 {
   "type": "reply_stream",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "delta": "partial content...",
   "full_text": "accumulated full text so far...",
@@ -259,6 +266,7 @@ Streaming delta for real-time typing preview. Only sent if the adapter declared 
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `session_id` | string | cc-connect conversation ID when available. |
 | `delta` | string | New text since last stream message. |
 | `full_text` | string | Full accumulated text. Adapters can use this for "replace entire message" updates. |
 | `preview_handle` | string | Handle returned by `preview_ack`. Empty on first stream message. |
@@ -273,6 +281,7 @@ Requests the adapter to create an initial preview message (for streaming).
   "type": "preview_start",
   "ref_id": "preview-req-001",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "content": "Thinking..."
 }
@@ -288,6 +297,7 @@ Requests the adapter to edit an existing message in-place. Used for streaming pr
 {
   "type": "update_message",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "preview_handle": "platform-msg-id-789",
   "content": "Updated text content..."
 }
@@ -301,6 +311,7 @@ Requests the adapter to delete a message (e.g., cleaning up preview messages).
 {
   "type": "delete_message",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "preview_handle": "platform-msg-id-789"
 }
 ```
@@ -313,6 +324,7 @@ Send a structured card to the user. Only sent if the adapter declared `"card"` c
 {
   "type": "card",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "card": {
     "header": {
@@ -354,6 +366,7 @@ Send a message with inline buttons. Only sent if the adapter declared `"buttons"
 {
   "type": "buttons",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "content": "Allow tool execution: bash(rm -rf /tmp/old)?",
   "buttons": [
@@ -375,6 +388,7 @@ Requests the adapter to show a typing indicator.
 {
   "type": "typing_start",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123"
 }
 ```
@@ -387,6 +401,7 @@ Requests the adapter to hide the typing indicator.
 {
   "type": "typing_stop",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123"
 }
 ```
@@ -399,6 +414,7 @@ Send a voice/audio message. Only sent if the adapter declared `"audio"` capabili
 {
   "type": "audio",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "data": "<base64-encoded-audio>",
   "format": "mp3"
@@ -628,12 +644,16 @@ Lists sessions for a given session key prefix (typically `platform:chatId`).
     "sessions": [
       {
         "id": "s1",
+        "session_key": "wechat:user123:user123",
         "name": "default",
+        "active": true,
         "history_count": 12
       },
       {
         "id": "s2",
+        "session_key": "wechat:user123:user123",
         "name": "work",
+        "active": false,
         "history_count": 5
       }
     ],
@@ -646,7 +666,7 @@ Lists sessions for a given session key prefix (typically `platform:chatId`).
 
 #### POST /bridge/sessions
 
-Creates a new named session.
+Creates a new named session. This always creates a distinct conversation under the same `session_key`; old sessions remain available by ID.
 
 **Request body:**
 
@@ -669,7 +689,10 @@ Creates a new named session.
   "ok": true,
   "data": {
     "id": "s3",
+    "session_key": "wechat:user123:user123",
     "name": "work",
+    "created_at": "2026-04-28T10:35:00Z",
+    "updated_at": "2026-04-28T10:35:00Z",
     "message": "session created"
   }
 }
@@ -695,7 +718,10 @@ Returns session detail with message history.
   "ok": true,
   "data": {
     "id": "s1",
+    "session_key": "wechat:user123:user123",
     "name": "default",
+    "created_at": "2026-04-28T09:00:00Z",
+    "updated_at": "2026-04-28T10:30:00Z",
     "history": [
       {"role": "user", "content": "Hello"},
       {"role": "assistant", "content": "Hi! How can I help?"}
@@ -738,14 +764,15 @@ Switches the active session for a session key.
 ```json
 {
   "session_key": "wechat:user123:user123",
-  "target": "s2"
+  "session_id": "s2"
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `session_key` | string | yes | Session key. |
-| `target` | string | yes | Session ID or name to switch to. |
+| `session_id` | string | yes | Session ID to switch to. |
+| `target` | string | no | Legacy alias for `session_id`; also accepts a session name. |
 
 **Response:**
 
@@ -754,6 +781,8 @@ Switches the active session for a session key.
   "ok": true,
   "data": {
     "message": "session switched",
+    "session_key": "wechat:user123:user123",
+    "session_id": "s2",
     "active_session_id": "s2"
   }
 }

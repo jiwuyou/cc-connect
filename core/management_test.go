@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -52,11 +54,14 @@ func testManagementServer(t *testing.T, token string) (*ManagementServer, *httpt
 	mux.HandleFunc(prefix+"/restart", mgmt.wrap(mgmt.handleRestart))
 	mux.HandleFunc(prefix+"/reload", mgmt.wrap(mgmt.handleReload))
 	mux.HandleFunc(prefix+"/config", mgmt.wrap(mgmt.handleConfig))
+	mux.HandleFunc(prefix+"/filesystem/directories", mgmt.wrap(mgmt.handleFilesystemDirectories))
 	mux.HandleFunc(prefix+"/projects", mgmt.wrap(mgmt.handleProjects))
 	mux.HandleFunc(prefix+"/projects/", mgmt.wrap(mgmt.handleProjectRoutes))
 	mux.HandleFunc(prefix+"/cron", mgmt.wrap(mgmt.handleCron))
 	mux.HandleFunc(prefix+"/cron/", mgmt.wrap(mgmt.handleCronByID))
 	mux.HandleFunc(prefix+"/bridge/adapters", mgmt.wrap(mgmt.handleBridgeAdapters))
+	mux.HandleFunc(prefix+"/apps", mgmt.wrap(mgmt.handleFrontendApps))
+	mux.HandleFunc(prefix+"/apps/", mgmt.wrap(mgmt.handleFrontendAppRoutes))
 
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -285,6 +290,36 @@ func TestMgmt_ProjectDetail(t *testing.T) {
 	}
 }
 
+func TestMgmt_ProjectDetailIncludesPermissionModes(t *testing.T) {
+	_, ts, e := testManagementServer(t, "tok")
+	e.agent = &stubModelModeAgent{mode: "yolo"}
+
+	r := mgmtGet(t, ts.URL+"/api/v1/projects/test-project", "tok")
+	if !r.OK {
+		t.Fatalf("project detail failed: %s", r.Error)
+	}
+
+	var data struct {
+		AgentMode       string `json:"agent_mode"`
+		PermissionModes []struct {
+			Key  string `json:"key"`
+			Name string `json:"name"`
+		} `json:"permission_modes"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal project detail: %v", err)
+	}
+	if data.AgentMode != "yolo" {
+		t.Fatalf("agent_mode = %q, want yolo", data.AgentMode)
+	}
+	if len(data.PermissionModes) != 2 {
+		t.Fatalf("permission_modes len = %d, want 2", len(data.PermissionModes))
+	}
+	if data.PermissionModes[1].Key != "yolo" {
+		t.Fatalf("permission_modes[1].key = %q, want yolo", data.PermissionModes[1].Key)
+	}
+}
+
 func TestMgmt_ProjectCreateAllowsEmptyWorkDir(t *testing.T) {
 	mgmt, ts, _ := testManagementServer(t, "tok")
 
@@ -352,6 +387,65 @@ func TestMgmt_ProjectCreatePropagatesRestartRequired(t *testing.T) {
 	}
 }
 
+func TestMgmt_FilesystemDirectoriesListAndCreate(t *testing.T) {
+	_, ts, _ := testManagementServer(t, "tok")
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "Beta"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "alpha"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("no"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reqURL := ts.URL + "/api/v1/filesystem/directories?path=" + url.QueryEscape(root)
+	r := mgmtGet(t, reqURL, "tok")
+	if !r.OK {
+		t.Fatalf("directories failed: %s", r.Error)
+	}
+	var data struct {
+		Path    string `json:"path"`
+		Parent  string `json:"parent"`
+		Entries []struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal directories: %v", err)
+	}
+	if data.Path != root {
+		t.Fatalf("path = %q, want %q", data.Path, root)
+	}
+	if len(data.Entries) != 2 {
+		t.Fatalf("entries = %+v, want two directories", data.Entries)
+	}
+	if data.Entries[0].Name != "alpha" || data.Entries[1].Name != "Beta" {
+		t.Fatalf("entries sorted/filtered incorrectly: %+v", data.Entries)
+	}
+
+	r = mgmtPost(t, ts.URL+"/api/v1/filesystem/directories", "tok", map[string]string{
+		"parent": root,
+		"name":   "created",
+	})
+	if !r.OK {
+		t.Fatalf("create directory failed: %s", r.Error)
+	}
+	if info, err := os.Stat(filepath.Join(root, "created")); err != nil || !info.IsDir() {
+		t.Fatalf("created directory missing or not directory: info=%v err=%v", info, err)
+	}
+
+	r = mgmtPost(t, ts.URL+"/api/v1/filesystem/directories", "tok", map[string]string{
+		"parent": root,
+		"name":   "../bad",
+	})
+	if r.OK {
+		t.Fatal("expected nested/path traversal directory name to be rejected")
+	}
+}
+
 func TestMgmt_ProjectDetailIncludesDisplayName(t *testing.T) {
 	mgmt, ts, e := testManagementServer(t, "tok")
 	e.SetDisplayName("Alias")
@@ -381,10 +475,48 @@ func TestMgmt_ProjectPatch(t *testing.T) {
 	}
 }
 
+func TestMgmt_ProjectPlatformDeleteReturnsRestartRequired(t *testing.T) {
+	mgmt, ts, _ := testManagementServer(t, "tok")
+
+	var gotProject, gotSelector string
+	mgmt.SetRemovePlatformFromProject(func(projectName, selector string) error {
+		gotProject = projectName
+		gotSelector = selector
+		return nil
+	})
+
+	r := mgmtDelete(t, ts.URL+"/api/v1/projects/test-project/platforms/0", "tok")
+	if !r.OK {
+		t.Fatalf("delete platform failed: %s", r.Error)
+	}
+	if gotProject != "test-project" || gotSelector != "0" {
+		t.Fatalf("callback got project=%q selector=%q", gotProject, gotSelector)
+	}
+
+	var data struct {
+		Message         string `json:"message"`
+		Project         string `json:"project"`
+		Selector        string `json:"selector"`
+		RestartRequired bool   `json:"restart_required"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal delete platform response: %v", err)
+	}
+	if data.Project != "test-project" || data.Selector != "0" {
+		t.Fatalf("response project=%q selector=%q", data.Project, data.Selector)
+	}
+	if !data.RestartRequired {
+		t.Fatal("restart_required = false, want true")
+	}
+	if !strings.Contains(data.Message, `platform "0" removed`) {
+		t.Fatalf("message = %q, want platform removed", data.Message)
+	}
+}
+
 func TestMgmt_Sessions(t *testing.T) {
 	_, ts, e := testManagementServer(t, "tok")
 
-	e.sessions.GetOrCreateActive("user1")
+	first := e.sessions.GetOrCreateActive("user1")
 
 	r := mgmtGet(t, ts.URL+"/api/v1/projects/test-project/sessions", "tok")
 	if !r.OK {
@@ -393,11 +525,83 @@ func TestMgmt_Sessions(t *testing.T) {
 
 	// Create a session via API
 	r = mgmtPost(t, ts.URL+"/api/v1/projects/test-project/sessions", "tok", map[string]string{
-		"session_key": "user2",
+		"session_key": "user1",
 		"name":        "work",
 	})
 	if !r.OK {
 		t.Fatalf("create session failed: %s", r.Error)
+	}
+	var created struct {
+		ID         string `json:"id"`
+		SessionKey string `json:"session_key"`
+		Name       string `json:"name"`
+		CreatedAt  string `json:"created_at"`
+		UpdatedAt  string `json:"updated_at"`
+	}
+	if err := json.Unmarshal(r.Data, &created); err != nil {
+		t.Fatalf("unmarshal created session: %v", err)
+	}
+	if created.ID == "" || created.ID == first.ID {
+		t.Fatalf("created id = %q, want non-empty and different from %q", created.ID, first.ID)
+	}
+	if created.SessionKey != "user1" {
+		t.Fatalf("session_key = %q, want user1", created.SessionKey)
+	}
+	if created.Name != "work" {
+		t.Fatalf("name = %q, want work", created.Name)
+	}
+	if created.CreatedAt == "" || created.UpdatedAt == "" {
+		t.Fatalf("timestamps missing: created_at=%q updated_at=%q", created.CreatedAt, created.UpdatedAt)
+	}
+	if got := e.sessions.ListSessions("user1"); len(got) != 2 {
+		t.Fatalf("ListSessions(user1) len = %d, want 2", len(got))
+	}
+	if active := e.sessions.ActiveSessionID("user1"); active != created.ID {
+		t.Fatalf("active session id = %q, want %q", active, created.ID)
+	}
+}
+
+func TestMgmt_SessionsLiveUsesSessionIDWhenRuntimeKeyIncludesIt(t *testing.T) {
+	_, ts, e := testManagementServer(t, "tok")
+
+	first := e.sessions.NewSession("webnew:web-admin:proj", "first")
+	second := e.sessions.NewSession("webnew:web-admin:proj", "second")
+	p := &stubPlatformEngine{n: "webnew"}
+	e.interactiveMu.Lock()
+	e.interactiveStates["webnew:web-admin:proj::"+second.ID] = &interactiveState{
+		platform: p,
+		replyCtx: "ctx",
+	}
+	e.interactiveMu.Unlock()
+
+	r := mgmtGet(t, ts.URL+"/api/v1/projects/test-project/sessions", "tok")
+	if !r.OK {
+		t.Fatalf("sessions list failed: %s", r.Error)
+	}
+	var data struct {
+		Sessions []struct {
+			ID       string `json:"id"`
+			Live     bool   `json:"live"`
+			Platform string `json:"platform"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal sessions: %v", err)
+	}
+	liveByID := make(map[string]bool)
+	platformByID := make(map[string]string)
+	for _, s := range data.Sessions {
+		liveByID[s.ID] = s.Live
+		platformByID[s.ID] = s.Platform
+	}
+	if liveByID[first.ID] {
+		t.Fatalf("first session live = true, want false")
+	}
+	if !liveByID[second.ID] {
+		t.Fatalf("second session live = false, want true")
+	}
+	if platformByID[second.ID] != "webnew" {
+		t.Fatalf("second platform = %q, want webnew", platformByID[second.ID])
 	}
 }
 
@@ -457,6 +661,54 @@ func TestMgmt_SessionPatchRename(t *testing.T) {
 	mode, _ := s.AliasInfo()
 	if mode != SessionAliasModeManual {
 		t.Fatalf("AliasMode = %q", mode)
+	}
+}
+
+func TestMgmt_SendAcceptsSessionID(t *testing.T) {
+	_, ts, e := testManagementServer(t, "tok")
+
+	first := e.sessions.NewSession("webnew:web-admin:proj", "first")
+	second := e.sessions.NewSession("webnew:web-admin:proj", "second")
+	firstPlatform := &stubPlatformEngine{n: "webnew"}
+	secondPlatform := &stubPlatformEngine{n: "webnew"}
+	e.platforms = []Platform{firstPlatform, secondPlatform}
+	e.interactiveMu.Lock()
+	e.interactiveStates["webnew:web-admin:proj::"+first.ID] = &interactiveState{
+		platform: firstPlatform,
+		replyCtx: "ctx-first",
+	}
+	e.interactiveStates["webnew:web-admin:proj::"+second.ID] = &interactiveState{
+		platform: secondPlatform,
+		replyCtx: "ctx-second",
+	}
+	e.interactiveMu.Unlock()
+
+	r := mgmtPost(t, ts.URL+"/api/v1/projects/test-project/send", "tok", map[string]string{
+		"session_id": second.ID,
+		"message":    "hello from api",
+	})
+	if !r.OK {
+		t.Fatalf("send failed: %s", r.Error)
+	}
+	var data struct {
+		SessionKey string `json:"session_key"`
+		SessionID  string `json:"session_id"`
+		Message    string `json:"message"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal send response: %v", err)
+	}
+	if data.SessionKey != "webnew:web-admin:proj" {
+		t.Fatalf("session_key = %q, want webnew:web-admin:proj", data.SessionKey)
+	}
+	if data.SessionID != second.ID {
+		t.Fatalf("session_id = %q, want %q", data.SessionID, second.ID)
+	}
+	if sent := firstPlatform.getSent(); len(sent) != 0 {
+		t.Fatalf("first session sent = %#v, want none", sent)
+	}
+	if sent := secondPlatform.getSent(); len(sent) != 1 || sent[0] != "hello from api" {
+		t.Fatalf("second session sent = %#v, want one API message", sent)
 	}
 }
 
@@ -542,6 +794,84 @@ func TestMgmt_BridgeAdapters(t *testing.T) {
 	r := mgmtGet(t, ts.URL+"/api/v1/bridge/adapters", "tok")
 	if !r.OK {
 		t.Fatalf("bridge adapters failed: %s", r.Error)
+	}
+}
+
+func TestMgmt_FrontendAppsCRUDAndPromote(t *testing.T) {
+	mgmt, ts, _ := testManagementServer(t, "tok")
+	storePath := filepath.Join(t.TempDir(), "frontend_apps.json")
+	mgmt.SetFrontendAppRegistry(NewFrontendAppRegistry(storePath))
+
+	r := mgmtPost(t, ts.URL+"/api/v1/apps", "tok", map[string]any{
+		"id":      "smallphone",
+		"name":    "SmallPhone",
+		"project": "smallphone-3e9fc251",
+	})
+	if !r.OK {
+		t.Fatalf("create frontend app failed: %s", r.Error)
+	}
+
+	r = mgmtPost(t, ts.URL+"/api/v1/apps/smallphone/slots", "tok", map[string]any{
+		"slot":             "stable",
+		"url":              "http://100.120.221.72:18080/",
+		"api_base":         "http://100.120.221.72:3100/api",
+		"adapter_platform": "smallphone",
+	})
+	if !r.OK {
+		t.Fatalf("create stable slot failed: %s", r.Error)
+	}
+
+	r = mgmtPost(t, ts.URL+"/api/v1/apps/smallphone/slots", "tok", map[string]any{
+		"slot":             "beta",
+		"url":              "http://100.120.221.72:18082/",
+		"api_base":         "http://100.120.221.72:3100/api",
+		"adapter_platform": "smallphone",
+	})
+	if !r.OK {
+		t.Fatalf("create beta slot failed: %s", r.Error)
+	}
+
+	r = mgmtPost(t, ts.URL+"/api/v1/apps/smallphone/slots/beta/promote", "tok", map[string]any{
+		"target_slot": "stable",
+	})
+	if !r.OK {
+		t.Fatalf("promote beta slot failed: %s", r.Error)
+	}
+
+	r = mgmtGet(t, ts.URL+"/api/v1/apps/smallphone", "tok")
+	if !r.OK {
+		t.Fatalf("get frontend app failed: %s", r.Error)
+	}
+	var data struct {
+		App FrontendApp `json:"app"`
+	}
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		t.Fatalf("unmarshal frontend app: %v", err)
+	}
+	if data.App.ID != "smallphone" || data.App.Project != "smallphone-3e9fc251" {
+		t.Fatalf("unexpected app: %+v", data.App)
+	}
+	stable := data.App.Slots["stable"]
+	if stable.URL != "http://100.120.221.72:18082/" {
+		t.Fatalf("stable url = %q, want promoted beta url", stable.URL)
+	}
+	if stable.Metadata["promoted_from"] != "beta" {
+		t.Fatalf("stable promoted_from = %q, want beta", stable.Metadata["promoted_from"])
+	}
+	if _, err := os.Stat(storePath); err != nil {
+		t.Fatalf("registry file was not persisted: %v", err)
+	}
+}
+
+func TestMgmt_FrontendAppsRequireRegistry(t *testing.T) {
+	_, ts, _ := testManagementServer(t, "tok")
+
+	r := mgmtGet(t, ts.URL+"/api/v1/apps", "tok")
+	if r.OK {
+		t.Fatal("expected frontend app registry error")
+	}
+	if !strings.Contains(r.Error, "not configured") {
+		t.Fatalf("error = %q, want not configured", r.Error)
 	}
 }
 

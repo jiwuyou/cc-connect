@@ -266,6 +266,7 @@ func TestBridge_MessageRouting(t *testing.T) {
 		"type":        "message",
 		"msg_id":      "m1",
 		"session_key": "mychat:user1:user1",
+		"session_id":  "s42",
 		"user_id":     "user1",
 		"user_name":   "Alice",
 		"content":     "hello bridge",
@@ -285,6 +286,9 @@ func TestBridge_MessageRouting(t *testing.T) {
 	}
 	if received.Platform != "mychat" {
 		t.Fatalf("platform = %q, want %q", received.Platform, "mychat")
+	}
+	if received.SessionID != "s42" {
+		t.Fatalf("session_id = %q, want s42", received.SessionID)
 	}
 	if received.UserName != "Alice" {
 		t.Fatalf("user_name = %q, want %q", received.UserName, "Alice")
@@ -361,6 +365,7 @@ func TestBridge_ReplyRouting(t *testing.T) {
 		"type":        "message",
 		"msg_id":      "m1",
 		"session_key": "rc:u1:u1",
+		"session_id":  "s99",
 		"user_id":     "u1",
 		"content":     "ping",
 		"reply_ctx":   "ctx-1",
@@ -375,6 +380,152 @@ func TestBridge_ReplyRouting(t *testing.T) {
 	}
 	if reply["reply_ctx"] != "ctx-1" {
 		t.Fatalf("reply_ctx = %q, want ctx-1", reply["reply_ctx"])
+	}
+	if reply["session_id"] != "s99" {
+		t.Fatalf("session_id = %q, want s99", reply["session_id"])
+	}
+}
+
+func TestBridge_CardActionCommandCarriesSessionID(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+
+	gotCh := make(chan *Message, 1)
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	bp.handler = func(p Platform, msg *Message) {
+		gotCh <- msg
+	}
+
+	conn := dialWS(t, wsURL, nil)
+	register(t, conn, "webnew", []string{"text", "card"})
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":        "card_action",
+		"session_key": "webnew:web-admin:proj",
+		"session_id":  "s-cmd",
+		"action":      "cmd:/model",
+		"reply_ctx":   "ctx-cmd",
+	})
+
+	var got *Message
+	select {
+	case got = <-gotCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected card action to dispatch as message")
+	}
+	if got.Content != "/model" {
+		t.Fatalf("content = %q, want /model", got.Content)
+	}
+	if got.SessionID != "s-cmd" {
+		t.Fatalf("session_id = %q, want s-cmd", got.SessionID)
+	}
+	rc, ok := got.ReplyCtx.(*bridgeReplyCtx)
+	if !ok {
+		t.Fatalf("reply ctx type = %T, want *bridgeReplyCtx", got.ReplyCtx)
+	}
+	if rc.SessionID != "s-cmd" {
+		t.Fatalf("reply ctx session_id = %q, want s-cmd", rc.SessionID)
+	}
+}
+
+func TestBridge_CardActionNavReplyCarriesSessionID(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+
+	gotCh := make(chan string, 1)
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	bp.SetCardNavigationHandlerWithSessionID(func(action string, sessionKey string, sessionID string) *Card {
+		if action != "nav:/model" {
+			t.Fatalf("action = %q, want nav:/model", action)
+		}
+		if sessionKey != "webnew:web-admin:proj" {
+			t.Fatalf("sessionKey = %q, want webnew:web-admin:proj", sessionKey)
+		}
+		gotCh <- sessionID
+		return NewCard().Markdown("updated").Build()
+	})
+
+	conn := dialWS(t, wsURL, nil)
+	register(t, conn, "webnew", []string{"text", "card"})
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":        "card_action",
+		"session_key": "webnew:web-admin:proj",
+		"session_id":  "s-nav",
+		"action":      "nav:/model",
+		"reply_ctx":   "ctx-nav",
+	})
+
+	card := readMsg(t, conn)
+	if card["type"] != "card" {
+		t.Fatalf("type = %q, want card", card["type"])
+	}
+	if card["session_key"] != "webnew:web-admin:proj" {
+		t.Fatalf("session_key = %q, want webnew:web-admin:proj", card["session_key"])
+	}
+	if card["session_id"] != "s-nav" {
+		t.Fatalf("session_id = %q, want s-nav", card["session_id"])
+	}
+	if card["reply_ctx"] != "ctx-nav" {
+		t.Fatalf("reply_ctx = %q, want ctx-nav", card["reply_ctx"])
+	}
+
+	select {
+	case got := <-gotCh:
+		if got != "s-nav" {
+			t.Fatalf("handler session_id = %q, want s-nav", got)
+		}
+	default:
+		t.Fatal("expected session-aware nav handler to receive session_id")
+	}
+}
+
+func TestBridge_CardActionNavFallsBackToLegacyHandler(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+
+	gotCh := make(chan struct{}, 1)
+
+	bp := bs.NewPlatform("test-proj")
+	e := NewEngine("test-proj", &stubAgent{}, []Platform{bp}, "", LangEnglish)
+	bs.RegisterEngine("test-proj", e, bp)
+	bp.SetCardNavigationHandler(func(action string, sessionKey string) *Card {
+		if action != "act:/model opus" {
+			t.Fatalf("action = %q, want act:/model opus", action)
+		}
+		if sessionKey != "webnew:web-admin:proj" {
+			t.Fatalf("sessionKey = %q, want webnew:web-admin:proj", sessionKey)
+		}
+		gotCh <- struct{}{}
+		return NewCard().Markdown("legacy").Build()
+	})
+
+	conn := dialWS(t, wsURL, nil)
+	register(t, conn, "webnew", []string{"text", "card"})
+
+	mustWriteJSON(t, conn, map[string]any{
+		"type":        "card_action",
+		"session_key": "webnew:web-admin:proj",
+		"session_id":  "s-legacy",
+		"action":      "act:/model opus",
+		"reply_ctx":   "ctx-legacy",
+	})
+
+	card := readMsg(t, conn)
+	if card["type"] != "card" {
+		t.Fatalf("type = %q, want card", card["type"])
+	}
+	if card["session_id"] != "s-legacy" {
+		t.Fatalf("session_id = %q, want s-legacy", card["session_id"])
+	}
+
+	select {
+	case <-gotCh:
+	default:
+		t.Fatal("expected legacy nav handler to be called")
 	}
 }
 
@@ -770,9 +921,22 @@ func TestBridge_SessionCreateAndDetail(t *testing.T) {
 		t.Fatalf("create failed: %s", r.Error)
 	}
 	var created struct {
-		ID string `json:"id"`
+		ID         string `json:"id"`
+		SessionKey string `json:"session_key"`
+		Name       string `json:"name"`
+		CreatedAt  string `json:"created_at"`
+		UpdatedAt  string `json:"updated_at"`
 	}
 	mustUnmarshalJSON(t, r.Data, &created)
+	if created.SessionKey != "test:u1:u1" {
+		t.Fatalf("session_key = %q, want test:u1:u1", created.SessionKey)
+	}
+	if created.Name != "dev" {
+		t.Fatalf("name = %q, want dev", created.Name)
+	}
+	if created.CreatedAt == "" || created.UpdatedAt == "" {
+		t.Fatalf("timestamps missing: created_at=%q updated_at=%q", created.CreatedAt, created.UpdatedAt)
+	}
 
 	// Get detail
 	r = bridgeGet(t, baseURL+"/bridge/sessions/"+created.ID+"?session_key=test:u1:u1", "tok")
@@ -780,16 +944,64 @@ func TestBridge_SessionCreateAndDetail(t *testing.T) {
 		t.Fatalf("get detail failed: %s", r.Error)
 	}
 	var detail struct {
-		ID      string           `json:"id"`
-		Name    string           `json:"name"`
-		History []map[string]any `json:"history"`
+		ID         string           `json:"id"`
+		SessionKey string           `json:"session_key"`
+		Name       string           `json:"name"`
+		CreatedAt  string           `json:"created_at"`
+		UpdatedAt  string           `json:"updated_at"`
+		History    []map[string]any `json:"history"`
 	}
 	mustUnmarshalJSON(t, r.Data, &detail)
 	if detail.ID != created.ID {
 		t.Fatalf("expected id %q, got %q", created.ID, detail.ID)
 	}
+	if detail.SessionKey != "test:u1:u1" {
+		t.Fatalf("session_key = %q, want test:u1:u1", detail.SessionKey)
+	}
 	if detail.Name != "dev" {
 		t.Fatalf("expected name 'dev', got %q", detail.Name)
+	}
+	if detail.CreatedAt == "" || detail.UpdatedAt == "" {
+		t.Fatalf("detail timestamps missing: created_at=%q updated_at=%q", detail.CreatedAt, detail.UpdatedAt)
+	}
+}
+
+func TestBridge_SessionCreateSameKeyCreatesDistinctSessions(t *testing.T) {
+	_, baseURL := startTestBridgeWithREST(t, "tok")
+
+	first := bridgePost(t, baseURL+"/bridge/sessions", "tok", map[string]string{
+		"session_key": "test:u1:u1",
+		"name":        "first",
+	})
+	if !first.OK {
+		t.Fatalf("create first failed: %s", first.Error)
+	}
+	second := bridgePost(t, baseURL+"/bridge/sessions", "tok", map[string]string{
+		"session_key": "test:u1:u1",
+		"name":        "second",
+	})
+	if !second.OK {
+		t.Fatalf("create second failed: %s", second.Error)
+	}
+	var a, b struct {
+		ID string `json:"id"`
+	}
+	mustUnmarshalJSON(t, first.Data, &a)
+	mustUnmarshalJSON(t, second.Data, &b)
+	if a.ID == "" || b.ID == "" || a.ID == b.ID {
+		t.Fatalf("expected distinct session ids, got first=%q second=%q", a.ID, b.ID)
+	}
+
+	list := bridgeGet(t, baseURL+"/bridge/sessions?session_key=test:u1:u1", "tok")
+	if !list.OK {
+		t.Fatalf("list sessions failed: %s", list.Error)
+	}
+	var listData struct {
+		Sessions []map[string]any `json:"sessions"`
+	}
+	mustUnmarshalJSON(t, list.Data, &listData)
+	if len(listData.Sessions) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(listData.Sessions))
 	}
 }
 
@@ -848,7 +1060,7 @@ func TestBridge_SessionSwitch(t *testing.T) {
 	// Switch to second
 	r = bridgePost(t, baseURL+"/bridge/sessions/switch", "tok", map[string]string{
 		"session_key": "test:u1:u1",
-		"target":      second.ID,
+		"session_id":  second.ID,
 	})
 	if !r.OK {
 		t.Fatalf("switch failed: %s", r.Error)

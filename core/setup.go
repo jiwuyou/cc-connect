@@ -480,3 +480,59 @@ func (m *ManagementServer) handleProjectAddPlatform(w http.ResponseWriter, r *ht
 		"restart_required": true,
 	})
 }
+
+func (m *ManagementServer) handleProjectRemovePlatform(w http.ResponseWriter, r *http.Request, projectName, selector string) {
+	if r.Method != http.MethodDelete {
+		mgmtError(w, http.StatusMethodNotAllowed, "DELETE only")
+		return
+	}
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		mgmtError(w, http.StatusBadRequest, "platform selector is required")
+		return
+	}
+	decodedSelector, err := url.PathUnescape(selector)
+	if err != nil {
+		mgmtError(w, http.StatusBadRequest, "invalid platform selector: "+err.Error())
+		return
+	}
+	if m.removePlatformFromProject == nil {
+		mgmtError(w, http.StatusServiceUnavailable, "config persistence not available")
+		return
+	}
+	if err := m.removePlatformFromProject(projectName, decodedSelector); err != nil {
+		mgmtError(w, platformRemoveErrorStatus(err), err.Error())
+		return
+	}
+	mgmtJSON(w, http.StatusOK, map[string]any{
+		"message":          fmt.Sprintf("platform %q removed from project %q", decodedSelector, projectName),
+		"project":          projectName,
+		"selector":         decodedSelector,
+		"restart_required": true,
+	})
+}
+
+func platformRemoveErrorStatus(err error) int {
+	type configErrorKind interface {
+		ConfigErrorKind() string
+	}
+	if kinded, ok := err.(configErrorKind); ok {
+		switch kinded.ConfigErrorKind() {
+		case "invalid_selector":
+			return http.StatusBadRequest
+		case "project_not_found", "platform_not_found":
+			return http.StatusNotFound
+		case "platform_ambiguous":
+			return http.StatusConflict
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "ambiguous"):
+		return http.StatusConflict
+	case strings.Contains(msg, "not found"):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
+}

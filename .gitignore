@@ -46,7 +46,9 @@ config.toml
 .npmrc
 package-lock.json
 node_modules/
+node_modules
 .vite/
+*.tsbuildinfo
 
 # ============================================================================
 # Build & distribution
@@ -63,6 +65,7 @@ web/dist/*
 # Testing & temporary files
 # ============================================================================
 test/
+test-results/
 scripts/
 tmp/
 temp/
@@ -121,6 +124,7 @@ Desktop.ini
 # AI agent planning artifacts
 # ============================================================================
 .planning/
+.codex
 
 # ============================================================================
 # Security

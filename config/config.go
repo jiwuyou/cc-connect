@@ -355,6 +355,46 @@ type PlatformConfig struct {
 	Options map[string]any `toml:"options"`
 }
 
+const (
+	ConfigErrorKindInvalidSelector   = "invalid_selector"
+	ConfigErrorKindProjectNotFound   = "project_not_found"
+	ConfigErrorKindPlatformNotFound  = "platform_not_found"
+	ConfigErrorKindPlatformAmbiguous = "platform_ambiguous"
+)
+
+type ConfigOperationError struct {
+	Kind string
+	Msg  string
+	Err  error
+}
+
+func (e *ConfigOperationError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Msg != "" {
+		return e.Msg
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "config operation failed"
+}
+
+func (e *ConfigOperationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *ConfigOperationError) ConfigErrorKind() string {
+	if e == nil {
+		return ""
+	}
+	return e.Kind
+}
+
 // AliasConfig maps a trigger string to a command (e.g. "帮助" → "/help").
 type AliasConfig struct {
 	Name    string `toml:"name"`    // trigger text (e.g. "帮助")
@@ -2396,6 +2436,7 @@ type ProjectSettingsUpdate struct {
 	WorkDir              *string
 	Mode                 *string
 	ShowContextIndicator *bool
+	ReplyFooter          *bool
 	PlatformAllowFrom    map[string]string
 }
 
@@ -2436,6 +2477,10 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 		if update.ShowContextIndicator != nil {
 			v := *update.ShowContextIndicator
 			proj.ShowContextIndicator = &v
+		}
+		if update.ReplyFooter != nil {
+			v := *update.ReplyFooter
+			proj.ReplyFooter = &v
 		}
 		if update.WorkDir != nil || update.Mode != nil {
 			if proj.Agent.Options == nil {
@@ -2517,6 +2562,9 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 		if p.ShowContextIndicator != nil {
 			result["show_context_indicator"] = *p.ShowContextIndicator
 		}
+		if p.ReplyFooter != nil {
+			result["reply_footer"] = *p.ReplyFooter
+		}
 		platConfigs := make([]map[string]any, len(p.Platforms))
 		for j, plat := range p.Platforms {
 			pc := map[string]any{"type": plat.Type}
@@ -2587,6 +2635,86 @@ func RemoveProject(projectName string) error {
 		return fmt.Errorf("project %q not found", projectName)
 	}
 	return saveConfig(cfg)
+}
+
+// RemovePlatformFromProject removes one platform config from a project.
+// selector supports a zero-based platform index or a unique platform type.
+func RemovePlatformFromProject(projectName, selector string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	projectIdx := -1
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name == projectName {
+			projectIdx = i
+			break
+		}
+	}
+	if projectIdx < 0 {
+		return &ConfigOperationError{
+			Kind: ConfigErrorKindProjectNotFound,
+			Msg:  fmt.Sprintf("project %q not found", projectName),
+		}
+	}
+	platformIdx, err := resolvePlatformSelector(cfg.Projects[projectIdx], selector)
+	if err != nil {
+		return err
+	}
+	platforms := cfg.Projects[projectIdx].Platforms
+	cfg.Projects[projectIdx].Platforms = append(platforms[:platformIdx], platforms[platformIdx+1:]...)
+	if err := saveConfig(cfg); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	return nil
+}
+
+func resolvePlatformSelector(project ProjectConfig, selector string) (int, error) {
+	sel := strings.TrimSpace(selector)
+	if sel == "" {
+		return -1, &ConfigOperationError{
+			Kind: ConfigErrorKindInvalidSelector,
+			Msg:  "platform selector is required",
+		}
+	}
+	if idx, err := strconv.Atoi(sel); err == nil {
+		if idx < 0 || idx >= len(project.Platforms) {
+			return -1, &ConfigOperationError{
+				Kind: ConfigErrorKindPlatformNotFound,
+				Msg:  fmt.Sprintf("platform index %d not found in project %q", idx, project.Name),
+			}
+		}
+		return idx, nil
+	}
+	matches := make([]int, 0, 1)
+	for i := range project.Platforms {
+		if strings.EqualFold(strings.TrimSpace(project.Platforms[i].Type), sel) {
+			matches = append(matches, i)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return -1, &ConfigOperationError{
+			Kind: ConfigErrorKindPlatformNotFound,
+			Msg:  fmt.Sprintf("platform selector %q not found in project %q", sel, project.Name),
+		}
+	case 1:
+		return matches[0], nil
+	default:
+		return -1, &ConfigOperationError{
+			Kind: ConfigErrorKindPlatformAmbiguous,
+			Msg:  fmt.Sprintf("platform selector %q is ambiguous in project %q (%d matches); use a numeric index", sel, project.Name, len(matches)),
+		}
+	}
 }
 
 // AddPlatformToProject appends a platform config to a project.

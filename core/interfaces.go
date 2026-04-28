@@ -188,10 +188,20 @@ type CardSender interface {
 // uses prefixes like "nav:/model" or "act:/model 3".
 type CardNavigationHandler func(action string, sessionKey string) *Card
 
+// CardNavigationHandlerWithSessionID is the session-aware variant used by
+// platforms that can carry a cc-connect session_id in card callbacks.
+type CardNavigationHandlerWithSessionID func(action string, sessionKey string, sessionID string) *Card
+
 // CardNavigable is an optional interface for platforms that support in-place
 // card navigation (updating the existing card instead of sending a new message).
 type CardNavigable interface {
 	SetCardNavigationHandler(h CardNavigationHandler)
+}
+
+// CardNavigableWithSessionID is an optional extension for platforms that can
+// route card navigation to a specific cc-connect session under the same key.
+type CardNavigableWithSessionID interface {
+	SetCardNavigationHandlerWithSessionID(h CardNavigationHandlerWithSessionID)
 }
 
 // CardRefresher is an optional interface for platforms that can update a
@@ -450,11 +460,11 @@ type LiveModeSwitcher interface {
 
 // PermissionModeInfo describes a permission mode for display.
 type PermissionModeInfo struct {
-	Key    string
-	Name   string
-	NameZh string
-	Desc   string
-	DescZh string
+	Key    string `json:"key"`
+	Name   string `json:"name"`
+	NameZh string `json:"nameZh"`
+	Desc   string `json:"desc"`
+	DescZh string `json:"descZh"`
 }
 
 // BotCommandInfo represents a command for bot menu registration (e.g. Telegram setMyCommands).

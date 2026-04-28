@@ -24,6 +24,30 @@ func TestSessionManager_GetOrCreateActive(t *testing.T) {
 	}
 }
 
+func TestSessionManager_GetByIDForKey(t *testing.T) {
+	sm := NewSessionManager("")
+	user1Session := sm.NewSession("user1", "first")
+	user2Session := sm.NewSession("user2", "second")
+
+	got, ok := sm.GetByIDForKey("user1", user1Session.ID)
+	if !ok {
+		t.Fatal("expected session to be found for owning user key")
+	}
+	if got.ID != user1Session.ID {
+		t.Fatalf("got session %q, want %q", got.ID, user1Session.ID)
+	}
+
+	if got, ok := sm.GetByIDForKey("user1", user2Session.ID); ok || got != nil {
+		t.Fatalf("cross-key lookup returned %#v, want not found", got)
+	}
+	if got, ok := sm.GetByIDForKey("user1", "missing"); ok || got != nil {
+		t.Fatalf("missing lookup returned %#v, want not found", got)
+	}
+	if got, ok := sm.GetByIDForKey("user1", " "); ok || got != nil {
+		t.Fatalf("empty lookup returned %#v, want not found", got)
+	}
+}
+
 func TestSessionManager_NewSession(t *testing.T) {
 	sm := NewSessionManager("")
 	s1 := sm.NewSession("user1", "chat-a")

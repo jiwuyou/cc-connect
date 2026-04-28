@@ -356,6 +356,7 @@ func main() {
 			}
 			return config.AddPlatformToProject(projectName, config.PlatformConfig{Type: platType, Options: opts}, workDir, agentType)
 		})
+		mgmtSrv.SetRemovePlatformFromProject(config.RemovePlatformFromProject)
 		mgmtSrv.SetCreateProject(func(projectName, displayName, workDir, agentType string) (string, bool, error) {
 			createdName, err := config.AddWebProject(projectName, displayName, workDir, agentType)
 			if err != nil {
@@ -376,6 +377,7 @@ func main() {
 				WorkDir:              u.WorkDir,
 				Mode:                 u.Mode,
 				ShowContextIndicator: u.ShowContextIndicator,
+				ReplyFooter:          u.ReplyFooter,
 				PlatformAllowFrom:    u.PlatformAllowFrom,
 			})
 		})
@@ -453,6 +455,7 @@ func main() {
 		if cfg.ProviderPresetsURL != "" {
 			core.SetPresetsURL(cfg.ProviderPresetsURL)
 		}
+		mgmtSrv.SetFrontendAppRegistry(core.NewFrontendAppRegistry(filepath.Join(cfg.DataDir, "frontend_apps.json")))
 		mgmtSrv.Start()
 	}
 

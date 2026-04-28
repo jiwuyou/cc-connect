@@ -443,6 +443,47 @@ Updates project settings. Only provided fields are updated.
 
 ---
 
+#### DELETE /api/v1/projects/{name}/platforms/{selector}
+
+Removes one platform entry from the project configuration. This is a config-only
+operation; the running process keeps its current platform connections until the
+service is restarted.
+
+**Path parameters:**
+
+| Param      | Type   | Description |
+|------------|--------|-------------|
+| `name`     | string | Project name |
+| `selector` | string | Zero-based platform index such as `0`, or a platform type that is unique within the project |
+
+If multiple platform entries have the same type, deleting by type fails with an
+ambiguity error; use the numeric index instead.
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "message": "platform \"telegram\" removed from project \"my-backend\"",
+    "project": "my-backend",
+    "selector": "telegram",
+    "restart_required": true
+  }
+}
+```
+
+**Errors:**
+
+| Status | Meaning |
+|--------|---------|
+| `400`  | Missing or invalid selector |
+| `404`  | Project or platform selector not found |
+| `409`  | Platform type selector is ambiguous |
+| `405`  | Method is not `DELETE` |
+
+---
+
 ### 5.3 Sessions
 
 Sessions are conversation contexts within a project. A session is identified by a `session_key` (format: `platform:chatId:userId`) and optionally by an internal `id` for named sessions (e.g. `/new work` creates a named session).
@@ -479,7 +520,7 @@ Lists sessions for a project with summary info including the last message previe
       }
     ],
     "active_keys": {
-      "telegram:123:456": "telegram"
+      "telegram:123:456::sess_abc123": "telegram"
     }
   }
 }
@@ -488,17 +529,17 @@ Lists sessions for a project with summary info including the last message previe
 | Field          | Type    | Description                                                       |
 |----------------|---------|-------------------------------------------------------------------|
 | `active`       | boolean | Whether this is the selected session for its user key             |
-| `live`         | boolean | Whether there is a running agent process for this session         |
+| `live`         | boolean | Whether there is a running agent process for this specific session |
 | `last_message` | object  | Preview of the last message (role, content truncated to 200 chars, timestamp). `null` if no history. |
 | `user_name`    | string  | Display name of the user (from platform metadata)                 |
 | `chat_name`    | string  | Name of the chat/channel (from platform metadata)                 |
-| `active_keys`  | object  | Map of session keys with active agent connections → platform name |
+| `active_keys`  | object  | Map of runtime keys with active agent connections → platform name. Specific conversations use `session_key::session_id`. |
 
 ---
 
 #### POST /api/v1/projects/{name}/sessions
 
-Creates a new session.
+Creates a new conversation session under the given `session_key`. This always creates a distinct session; it does not return or overwrite the current active session.
 
 **Request body:**
 
@@ -523,7 +564,8 @@ Creates a new session.
     "id": "sess_xyz789",
     "session_key": "telegram:123:456",
     "name": "work",
-    "created_at": "2026-03-10T10:35:00Z"
+    "created_at": "2026-03-10T10:35:00Z",
+    "updated_at": "2026-03-10T10:35:00Z"
   }
 }
 ```
@@ -628,6 +670,8 @@ Switches the active session for a given session_key (e.g. when a user has multip
   "ok": true,
   "data": {
     "message": "active session switched",
+    "session_key": "telegram:123:456",
+    "session_id": "sess_xyz789",
     "active_session_id": "sess_xyz789"
   }
 }
@@ -637,20 +681,22 @@ Switches the active session for a given session_key (e.g. when a user has multip
 
 #### POST /api/v1/projects/{name}/send
 
-Sends a message to a session. The message is delivered to the agent as if the user had sent it via the platform. **Requires the session to be live** (i.e., have an active agent process). Check the `live` field from session detail to verify before sending.
+Sends a message to a session. The message is delivered to the agent as if the user had sent it via the platform. **Requires the target session to be live** (i.e., have an active agent process). Check the `live` field from session detail to verify before sending.
 
 **Request body:**
 
 ```json
 {
   "session_key": "telegram:123:456",
+  "session_id": "sess_xyz789",
   "message": "Review the latest commit"
 }
 ```
 
 | Field         | Type   | Required | Description                    |
 |---------------|--------|----------|--------------------------------|
-| `session_key`| string | yes      | Platform routing key           |
+| `session_key`| string | yes*     | Platform routing key. Optional when `session_id` is provided. |
+| `session_id` | string | no       | Specific conversation under `session_key`; when provided, routing targets that exact live conversation. Old clients may omit it to use active-session behavior. |
 | `message`    | string | yes      | Text to send to the agent      |
 
 **Response:**
@@ -659,7 +705,9 @@ Sends a message to a session. The message is delivered to the agent as if the us
 {
   "ok": true,
   "data": {
-    "message": "message sent"
+    "message": "message sent",
+    "session_key": "telegram:123:456",
+    "session_id": "sess_xyz789"
   }
 }
 ```

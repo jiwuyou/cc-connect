@@ -278,6 +278,27 @@ func (sm *SessionManager) GetOrCreateActive(userKey string) *Session {
 	return s
 }
 
+// GetByIDForKey returns a session only when the given ID belongs to userKey.
+// It intentionally does not fall back to any other user key or active session.
+func (sm *SessionManager) GetByIDForKey(userKey, sessionID string) (*Session, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, false
+	}
+
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, sid := range sm.userSessions[userKey] {
+		if sid != sessionID {
+			continue
+		}
+		s := sm.sessions[sid]
+		return s, s != nil
+	}
+	return nil, false
+}
+
 func (sm *SessionManager) NewSession(userKey, name string) *Session {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()

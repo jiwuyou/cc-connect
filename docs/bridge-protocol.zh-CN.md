@@ -131,6 +131,7 @@ token = "your-secret"     # 认证密钥，必填
   "type": "message",
   "msg_id": "msg-001",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "user_id": "user123",
   "user_name": "Alice",
   "content": "你好，你能做什么？",
@@ -148,6 +149,7 @@ token = "your-secret"     # 认证密钥，必填
 | `type` | string | 是 | `"message"` |
 | `msg_id` | string | 是 | 平台消息 ID，用于追踪。 |
 | `session_key` | string | 是 | 唯一会话标识。格式：`{platform}:{scope}:{user}`。由适配器定义组合方式。 |
+| `session_id` | string | 否 | `session_key` 下的 cc-connect 对话 ID。省略时保持旧的活跃会话行为。 |
 | `user_id` | string | 是 | 用户在平台上的唯一标识。 |
 | `user_name` | string | 否 | 显示名称。 |
 | `content` | string | 是 | 文本内容。 |
@@ -164,6 +166,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "card_action",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "action": "cmd:/new",
   "reply_ctx": "conv-abc-123"
 }
@@ -175,6 +178,7 @@ token = "your-secret"     # 认证密钥，必填
 |------|------|------|------|
 | `type` | string | 是 | `"card_action"` |
 | `session_key` | string | 是 | 触发操作的会话。 |
+| `session_id` | string | 否 | `session_key` 下的 cc-connect 对话 ID。类消息动作（`perm:`、`askq:`、`cmd:`）会路由到该对话；回复/更新 payload 在提供时会回传该字段。当前原地更新的 `nav:`/`act:` handler 只接收 `session_key`，但返回 payload 仍会回传 `session_id`。省略时保持旧的活跃会话行为。 |
 | `action` | string | 是 | 按钮的回调值（如 `"cmd:/new"`、`"nav:/model"`、`"act:/heartbeat pause"`）。 |
 | `reply_ctx` | string | 是 | 用于路由响应的回复上下文。 |
 
@@ -225,6 +229,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "reply",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "content": "我可以帮你完成编码任务！",
   "format": "text"
@@ -237,6 +242,7 @@ token = "your-secret"     # 认证密钥，必填
 |------|------|------|------|
 | `type` | string | 是 | `"reply"` |
 | `session_key` | string | 是 | 目标会话。 |
+| `session_id` | string | 否 | 原始消息/卡片动作携带时回传的 cc-connect 对话 ID。 |
 | `reply_ctx` | string | 是 | 来自原始消息的回传。 |
 | `content` | string | 是 | 回复文本内容。 |
 | `format` | string | 否 | `"text"`（默认）或 `"markdown"`。 |
@@ -249,6 +255,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "reply_stream",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "delta": "部分内容...",
   "full_text": "累积的完整文本...",
@@ -259,6 +266,7 @@ token = "your-secret"     # 认证密钥，必填
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `session_id` | string | 可用时携带的 cc-connect 对话 ID。 |
 | `delta` | string | 自上次流式消息以来的新增文本。 |
 | `full_text` | string | 完整累积文本。适配器可用于"替换整条消息"的更新方式。 |
 | `preview_handle` | string | 由 `preview_ack` 返回的 handle。首条流式消息时为空。 |
@@ -273,6 +281,7 @@ token = "your-secret"     # 认证密钥，必填
   "type": "preview_start",
   "ref_id": "preview-req-001",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "content": "思考中..."
 }
@@ -288,6 +297,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "update_message",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "preview_handle": "platform-msg-id-789",
   "content": "更新后的文本内容..."
 }
@@ -301,6 +311,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "delete_message",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "preview_handle": "platform-msg-id-789"
 }
 ```
@@ -313,6 +324,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "card",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "card": {
     "header": {
@@ -354,6 +366,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "buttons",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "content": "允许执行工具：bash(rm -rf /tmp/old)？",
   "buttons": [
@@ -375,6 +388,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "typing_start",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123"
 }
 ```
@@ -387,6 +401,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "typing_stop",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123"
 }
 ```
@@ -399,6 +414,7 @@ token = "your-secret"     # 认证密钥，必填
 {
   "type": "audio",
   "session_key": "wechat:user123:user123",
+  "session_id": "s2",
   "reply_ctx": "conv-abc-123",
   "data": "<base64 编码的音频数据>",
   "format": "mp3"
@@ -628,12 +644,16 @@ Session key 遵循以下格式：
     "sessions": [
       {
         "id": "s1",
+        "session_key": "wechat:user123:user123",
         "name": "default",
+        "active": true,
         "history_count": 12
       },
       {
         "id": "s2",
+        "session_key": "wechat:user123:user123",
         "name": "work",
+        "active": false,
         "history_count": 5
       }
     ],
@@ -646,7 +666,7 @@ Session key 遵循以下格式：
 
 #### POST /bridge/sessions
 
-创建新的命名会话。
+创建新的命名会话。该接口总是在同一个 `session_key` 下创建独立对话，旧会话仍可通过 ID 访问。
 
 **请求体：**
 
@@ -669,7 +689,10 @@ Session key 遵循以下格式：
   "ok": true,
   "data": {
     "id": "s3",
+    "session_key": "wechat:user123:user123",
     "name": "work",
+    "created_at": "2026-04-28T10:35:00Z",
+    "updated_at": "2026-04-28T10:35:00Z",
     "message": "session created"
   }
 }
@@ -695,7 +718,10 @@ Session key 遵循以下格式：
   "ok": true,
   "data": {
     "id": "s1",
+    "session_key": "wechat:user123:user123",
     "name": "default",
+    "created_at": "2026-04-28T09:00:00Z",
+    "updated_at": "2026-04-28T10:30:00Z",
     "history": [
       {"role": "user", "content": "你好"},
       {"role": "assistant", "content": "你好！有什么可以帮你的？"}
@@ -738,14 +764,15 @@ Session key 遵循以下格式：
 ```json
 {
   "session_key": "wechat:user123:user123",
-  "target": "s2"
+  "session_id": "s2"
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `session_key` | string | 是 | Session key。 |
-| `target` | string | 是 | 要切换到的会话 ID 或名称。 |
+| `session_id` | string | 是 | 要切换到的会话 ID。 |
+| `target` | string | 否 | `session_id` 的旧别名；也兼容会话名称。 |
 
 **响应：**
 
@@ -754,6 +781,8 @@ Session key 遵循以下格式：
   "ok": true,
   "data": {
     "message": "session switched",
+    "session_key": "wechat:user123:user123",
+    "session_id": "s2",
     "active_session_id": "s2"
   }
 }
